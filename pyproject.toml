@@ -1,0 +1,32 @@
+[project]
+name = "agent-forge"
+version = "0.1.0"
+description = "Framework-agnostic AI agent orchestration — manager + factory pattern with AutoGen, LangGraph, and Anthropic backends."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  # Core
+  "pydantic>=2.0",
+  "python-dotenv>=1.0.1",
+
+  # AutoGen backend (working)
+  "autogen-agentchat>=0.4.8",
+  "autogen-ext[openai]>=0.4.8",
+
+  # LangGraph backend (stub — uncomment when implementing)
+  # "langgraph>=0.2.0",
+  # "langchain-openai>=0.1.0",
+
+  # Anthropic backend (stub — uncomment when implementing)
+  # "anthropic>=0.40.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
