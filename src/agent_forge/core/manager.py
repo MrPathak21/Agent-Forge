@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_forge.core.agent import BaseAgent
 from agent_forge.core.factory import AgentFactory
+
+if TYPE_CHECKING:
+    from agent_forge.core.shared_thread import SharedThread
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +58,33 @@ class AgentManager:
     # Task execution
     # ------------------------------------------------------------------
 
-    async def run_task(self, agent_id: str, task: str, **kwargs: Any) -> str:
-        """Route a task to a specific agent and return its response."""
+    async def run_task(
+        self,
+        agent_id: str,
+        task: str,
+        *,
+        thread: SharedThread | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """
+        Route a task to a specific agent and return its response.
+
+        If a SharedThread is provided, prior agent findings are injected as
+        context before the task runs, and the result is appended to the thread.
+        """
         agent = self._factory.get(agent_id)
         logger.info("Running task on agent id=%s", agent_id)
-        return await agent.run(task, **kwargs)
+
+        full_task = task
+        if thread and not thread.is_empty():
+            full_task = f"{task}\n\n{thread.to_context()}"
+
+        result = await agent.run(full_task, **kwargs)
+
+        if thread is not None:
+            thread.add(agent.name, result)
+
+        return result
 
     # ------------------------------------------------------------------
     # Introspection

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from agent_forge.config.settings import ProviderConfig, Settings
+
+if TYPE_CHECKING:
+    from agent_forge.core.shared_thread import SharedThread
 
 
 class AgentSpec(BaseModel):
@@ -72,3 +75,54 @@ class Orchestrator:
         )
         data = json.loads(response.choices[0].message.content)
         return [AgentSpec(**spec) for spec in data["agents"]]
+
+    async def plan_stream(self, goal: str):
+        """
+        Async generator for live UI display.
+        Yields str chunks while the LLM is writing the plan, then yields
+        list[AgentSpec] as the final item once the response is complete.
+        """
+        stream = await self._client.chat.completions.create(
+            model=self._config.model,
+            response_format={"type": "json_object"},
+            stream=True,
+            messages=[
+                {"role": "system", "content": self._SYSTEM},
+                {"role": "user", "content": f"Goal: {goal}"},
+            ],
+        )
+        chunks: list[str] = []
+        async for chunk in stream:
+            text = chunk.choices[0].delta.content or ""
+            if text:
+                chunks.append(text)
+                yield text
+
+        data = json.loads("".join(chunks))
+        yield [AgentSpec(**spec) for spec in data["agents"]]
+
+    _SYNTHESIZE_SYSTEM = (
+        "You are a senior analyst synthesizing the findings from multiple AI agents. "
+        "Given the original goal and each agent's contribution, produce a single, clean, "
+        "well-structured final response for the user. Eliminate redundancy, resolve any "
+        "contradictions, and present the most important insights clearly and concisely."
+    )
+
+    async def synthesize_stream(self, goal: str, thread: SharedThread):
+        """
+        Async generator. Reads the full shared thread and streams a clean
+        final synthesis back to the user.
+        """
+        context = thread.to_context()
+        stream = await self._client.chat.completions.create(
+            model=self._config.model,
+            stream=True,
+            messages=[
+                {"role": "system", "content": self._SYNTHESIZE_SYSTEM},
+                {"role": "user", "content": f"Goal: {goal}\n\n{context}"},
+            ],
+        )
+        async for chunk in stream:
+            text = chunk.choices[0].delta.content or ""
+            if text:
+                yield text
