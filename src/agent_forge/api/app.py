@@ -27,6 +27,7 @@ from agent_forge.backends.autogen import AutoGenFactory
 from agent_forge.core.conversation import AgentConversation, ConversationMessage, StopSignal
 from agent_forge.core.manager import AgentManager
 from agent_forge.core.orchestrator import AgentSpec, Orchestrator, OrchestratorToolCall
+from agent_forge.tools.mcp_bridge import MCPBridge
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -82,7 +83,17 @@ async def _pipeline(req: RunRequest) -> AsyncGenerator[tuple[str, str], None]:
     """
     Runs the full pipeline and yields (event_type, json_str) tuples.
     Callers filter by detail level.
+
+    Wraps the entire run in an MCPBridge context so MCP tools are
+    registered before the orchestrator plans and cleaned up after shutdown.
     """
+    async with MCPBridge():
+        async for event in _pipeline_inner(req):
+            yield event
+
+
+async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], None]:
+    """Core pipeline logic, called inside an active MCPBridge context."""
     orchestrator = Orchestrator(provider=req.provider)
 
     # Phase 1: Research + plan

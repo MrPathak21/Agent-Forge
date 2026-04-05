@@ -136,7 +136,11 @@ class Orchestrator:
             for tc in msg.tool_calls:
                 fn = get_tool(tc.function.name)
                 args = json.loads(tc.function.arguments)
-                result = fn(**args)
+                import inspect as _inspect
+                if _inspect.iscoroutinefunction(fn):
+                    result = await fn(**args)
+                else:
+                    result = fn(**args)
                 tool_calls_made.append(
                     OrchestratorToolCall(tool=tc.function.name, args=args, result=result)
                 )

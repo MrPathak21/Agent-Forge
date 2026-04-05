@@ -143,6 +143,52 @@ data: {"type": "error", "message": "..."}
 
 ---
 
+## MCP servers
+
+agent-forge supports [Model Context Protocol](https://modelcontextprotocol.io) servers as a first-class tool source. Any MCP server's tools are automatically discovered at startup, registered in the tool registry, and made available for the orchestrator to assign to agents — no code changes needed.
+
+### Setup
+
+Copy the example config and edit it:
+
+```bash
+cp mcp_servers.example.json mcp_servers.json
+```
+
+`mcp_servers.json` (project root):
+
+```json
+[
+  {
+    "name": "filesystem",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/data"]
+  },
+  {
+    "name": "myserver",
+    "url": "http://localhost:3000/sse"
+  }
+]
+```
+
+Each server's tools are registered as `mcp_{name}_{tool_name}` (e.g. `mcp_filesystem_read_file`). The orchestrator sees them in its available tools list and assigns them to agents that need them.
+
+### Adding a new server
+
+1. Add an entry to `mcp_servers.json`
+2. Restart the backend
+
+That's it — no Python code to write.
+
+### Transports
+
+| Field | Transport | Example |
+|---|---|---|
+| `command` + `args` | stdio (subprocess) | `"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]` |
+| `url` | HTTP / SSE | `"url": "http://localhost:3000/sse"` |
+
+---
+
 ## Tool library
 
 Tools are auto-discovered via a `@register` decorator. The orchestrator gets `web_search` and `get_datetime` to stay current before planning. Agents receive whichever tools the orchestrator assigns per goal.

@@ -25,8 +25,8 @@ _MODULES = [
 def register(name: str, description: str = ""):
     """Decorator that registers a function as a named tool."""
     def decorator(fn: Callable) -> Callable:
-        fn._tool_name = name
-        fn._tool_description = description or fn.__doc__ or ""
+        setattr(fn, "_tool_name", name)
+        setattr(fn, "_tool_description", description or fn.__doc__ or "")
         _REGISTRY[name] = fn
         return fn
     return decorator
@@ -109,3 +109,24 @@ def get_openai_schemas(names: list[str]) -> list[dict]:
     """Return OpenAI function schemas for the given tool names."""
     _ensure_loaded()
     return [to_openai_schema(_REGISTRY[n]) for n in names if n in _REGISTRY]
+
+
+def register_callable(name: str, fn: Callable, description: str = "") -> None:
+    """Register an already-created callable directly.
+
+    Used by MCPBridge to inject MCP tool wrappers at runtime without
+    going through the ``@register`` decorator.
+    """
+    setattr(fn, "_tool_name", name)
+    setattr(fn, "_tool_description", description)
+    _REGISTRY[name] = fn
+
+
+def unregister(names: list[str]) -> None:
+    """Remove tool names from the registry.
+
+    Used by MCPBridge on exit to clean up MCP tools so they don't
+    persist between pipeline runs.
+    """
+    for name in names:
+        _REGISTRY.pop(name, None)

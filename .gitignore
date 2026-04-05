@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# MCP server config (local — copy from mcp_servers.example.json)
+mcp_servers.json
+
 # Python
 __pycache__/
 *.py[cod]

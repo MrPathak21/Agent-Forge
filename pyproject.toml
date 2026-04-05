@@ -25,6 +25,7 @@ dependencies = [
   "ddgs>=0.1",
   "yfinance>=0.2",
   "wikipedia>=1.4",
+  "mcp>=1.0",
 
   # LangGraph backend (stub — uncomment when implementing)
   # "langgraph>=0.2.0",

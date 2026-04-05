@@ -1,0 +1,16 @@
+[
+  {
+    "name": "filesystem",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/data"]
+  },
+  {
+    "name": "github",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"]
+  },
+  {
+    "name": "myserver",
+    "url": "http://localhost:3000/sse"
+  }
+]
