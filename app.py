@@ -1,117 +1,70 @@
 from __future__ import annotations
 
 """
-Streamlit UI for agent-forge.
+agent-forge Streamlit frontend.
+
+Requires the backend to be running:
+    uvicorn agent_forge.api.app:app --reload --port 8000
 
 Run:
     streamlit run app.py
 """
 
-import asyncio
-import queue
-import threading
+import json
 
+import httpx
 import streamlit as st
 
-from agent_forge.backends.autogen import AutoGenFactory
-from agent_forge.core.conversation import AgentConversation, ConversationMessage, StopSignal
-from agent_forge.core.manager import AgentManager
-from agent_forge.core.orchestrator import AgentSpec, Orchestrator, OrchestratorToolCall
+API_URL = "http://localhost:8000"
 
-# ── Async helpers ─────────────────────────────────────────────────────────────
+# ── API helpers ───────────────────────────────────────────────────────────────
 
-def run_async(coro):
-    """Run an async coroutine synchronously in a dedicated thread."""
-    result_box: list = [None]
-    error_box: list = [None]
-
-    def target():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result_box[0] = loop.run_until_complete(coro)
-        except Exception as exc:
-            error_box[0] = exc
-        finally:
-            loop.close()
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join()
-    if error_box[0]:
-        raise error_box[0]
-    return result_box[0]
+def stream_run(goal: str, max_rounds: int):
+    """Consume SSE events from POST /run/stream."""
+    with httpx.Client(timeout=300) as client:
+        with client.stream(
+            "POST",
+            f"{API_URL}/run/stream",
+            json={"goal": goal, "max_rounds": max_rounds},
+        ) as resp:
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
 
 
-def iter_async_stream(async_gen_factory):
-    """
-    Sync generator that bridges any async generator to Streamlit.
-    Pass a zero-argument lambda that returns the async generator.
-    """
-    q: queue.Queue = queue.Queue()
-    sentinel = object()
-
-    async def drain():
-        async for item in async_gen_factory():
-            q.put(item)
-        q.put(sentinel)
-
-    def target():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(drain())
-        finally:
-            loop.close()
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    while True:
-        item = q.get()
-        if item is sentinel:
-            break
-        yield item
-    t.join()
+def fetch_tools() -> list[str]:
+    try:
+        return httpx.get(f"{API_URL}/tools", timeout=5).json().get("tools", [])
+    except Exception:
+        return []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# One color per agent (cycles if more than 6)
 _AGENT_COLORS = ["#4F8EF7", "#F7874F", "#4FD18C", "#F7CF4F", "#C44FF7", "#F74F6E"]
 
-def _agent_color(name: str, specs: list[AgentSpec]) -> str:
-    names = [s.name for s in specs]
-    idx = names.index(name) if name in names else 0
+def _agent_color(name: str, agent_names: list[str]) -> str:
+    idx = agent_names.index(name) if name in agent_names else 0
     return _AGENT_COLORS[idx % len(_AGENT_COLORS)]
 
 
-def render_conversation(
-    messages: list[ConversationMessage],
-    specs: list[AgentSpec],
-    stop: StopSignal | None = None,
-) -> str:
-    """Render the conversation as markdown for st.markdown()."""
+def render_conversation(messages: list[dict], agent_names: list[str], stop: dict | None) -> str:
     if not messages:
         return ""
-
     md_parts = []
     current_round = 0
-
     for msg in messages:
-        if msg.round != current_round:
-            current_round = msg.round
+        if msg["round"] != current_round:
+            current_round = msg["round"]
             md_parts.append(f"**── Round {current_round} ──**")
-
-        color = _agent_color(msg.agent, specs)
+        color = _agent_color(msg["agent"], agent_names)
         md_parts.append(
-            f'<span style="color:{color}; font-weight:600">{msg.agent}</span>\n\n'
-            f"{msg.content}"
+            f'<span style="color:{color}; font-weight:600">{msg["agent"]}</span>\n\n'
+            f'{msg["content"]}'
         )
-
     if stop:
-        icon = "✅" if stop.stopped_by == "orchestrator" else "⏹️"
-        md_parts.append(f"---\n{icon} *{stop.reason}*")
-
+        icon = "✅" if stop["stopped_by"] == "orchestrator" else "⏹️"
+        md_parts.append(f"---\n{icon} *{stop['reason']}*")
     return "\n\n---\n\n".join(md_parts)
 
 
@@ -128,8 +81,8 @@ tab_chat, tab_orch, tab_agents = st.tabs(["💬 Chat", "🧠 Orchestrator", "�
 
 with tab_chat:
     DEFAULT_GOAL = (
-        "Analyse the impact of rising US interest rates on emerging market equities "
-        "and produce a concise investment brief."
+        "What is the current stock price of Nvidia and Tesla, and given today's market "
+        "conditions and recent AI news, which one is a better buy right now?"
     )
     goal = st.text_area("Goal", value=DEFAULT_GOAL, height=80)
     col_btn, col_rounds = st.columns([3, 1])
@@ -146,7 +99,7 @@ with tab_chat:
 with tab_orch:
     orch_status = st.empty()
     orch_raw = st.empty()
-    orch_specs_area = st.container()
+    orch_details = st.container()
 
 # ── Tab 3: Agent Activity ─────────────────────────────────────────────────────
 
@@ -158,118 +111,87 @@ with tab_agents:
 if not run_btn:
     st.stop()
 
-# ── Step 1: Stream orchestrator planning → Tab 2 ─────────────────────────────
+# ── Stream from API ───────────────────────────────────────────────────────────
 
-chat_status.info("⏳ Planning agents...")
+chat_status.info("⏳ Connecting to backend...")
 orch_status.info("Researching goal...")
 
-full_text = ""
-specs: list[AgentSpec] = []
-tool_calls_made: list[OrchestratorToolCall] = []
-orchestrator = Orchestrator(provider="openai")
-
-for item in iter_async_stream(lambda: orchestrator.plan_stream(goal)):
-    if isinstance(item, OrchestratorToolCall):
-        tool_calls_made.append(item)
-        # Show research progress live
-        with orch_specs_area:
-            st.markdown("#### 🔍 Research")
-            for tc in tool_calls_made:
-                with st.expander(f"`{tc.tool}({', '.join(f'{k}={v!r}' for k, v in tc.args.items())})`"):
-                    st.markdown(tc.result)
-        orch_status.info(f"Researched with {len(tool_calls_made)} tool call(s) — now planning...")
-    elif isinstance(item, list):
-        specs = item
-    else:
-        full_text += item
-        orch_raw.code(full_text + "▌", language="json")
-
-orch_raw.code(full_text, language="json")
-orch_status.success(f"Planned {len(specs)} agent(s)")
-
-with orch_specs_area:
-    if tool_calls_made:
-        st.markdown("#### 🔍 Research")
-        for tc in tool_calls_made:
-            with st.expander(f"`{tc.tool}({', '.join(f'{k}={v!r}' for k, v in tc.args.items())})`"):
-                st.markdown(tc.result)
-    st.markdown("#### Agent specs")
-    for spec in specs:
-        with st.expander(f"`{spec.name}` — {spec.role_description}"):
-            st.markdown(f"**System prompt**\n\n{spec.system_prompt}")
-            if spec.tools:
-                st.markdown(f"**Tools:** {', '.join(spec.tools)}")
-
-# ── Step 2: Show agent legend → Tab 3 ────────────────────────────────────────
-
-with agents_legend:
-    cols = st.columns(len(specs))
-    for i, spec in enumerate(specs):
-        color = _agent_color(spec.name, specs)
-        cols[i].markdown(
-            f'<span style="color:{color}; font-weight:700">● {spec.name}</span><br>'
-            f'<span style="font-size:0.85em">{spec.role_description}</span>',
-            unsafe_allow_html=True,
-        )
-
-# ── Step 3: Spawn agents ──────────────────────────────────────────────────────
-
-chat_status.info("⏳ Spawning agents...")
-
-factory = AutoGenFactory(provider="openai")
-manager = AgentManager(factory)
-
-agents = []
-for spec in specs:
-    agent = run_async(manager.spawn(
-        role=spec.role_description,
-        name=spec.name,
-        system_message=spec.system_prompt,
-    ))
-    agents.append(agent)
-
-# ── Step 4: Run conversation → Tab 3 ─────────────────────────────────────────
-
-chat_status.info("⏳ Agents in conversation...")
-
-conversation = AgentConversation(
-    manager=manager,
-    agents=agents,
-    orchestrator=orchestrator,
-    max_rounds=int(max_rounds),
-)
-
-conv_messages: list[ConversationMessage] = []
-stop_signal: StopSignal | None = None
-
-for item in iter_async_stream(lambda: conversation.run_stream(goal)):
-    if isinstance(item, ConversationMessage):
-        conv_messages.append(item)
-        conv_display.markdown(
-            render_conversation(conv_messages, specs),
-            unsafe_allow_html=True,
-        )
-    elif isinstance(item, StopSignal):
-        stop_signal = item
-        conv_display.markdown(
-            render_conversation(conv_messages, specs, stop_signal),
-            unsafe_allow_html=True,
-        )
-
-# ── Step 5: Synthesize → Tab 1 ────────────────────────────────────────────────
-
-chat_status.info("⏳ Synthesizing final report...")
-
+# State accumulated across events
+tool_calls: list[dict] = []
+plan_text = ""
+specs: list[dict] = []
+agent_names: list[str] = []
+conv_messages: list[dict] = []
+stop_signal: dict | None = None
 synthesis_text = ""
-context_text = conversation.to_context_text()
 
-for chunk in iter_async_stream(lambda: orchestrator.synthesize_stream(goal, context_text)):
-    synthesis_text += chunk
-    final_report.markdown(synthesis_text + "▌")
+for event in stream_run(goal, int(max_rounds)):
+    etype = event.get("type")
 
-final_report.markdown(synthesis_text)
-chat_status.success("✅ Done")
+    if etype == "orchestrator_tool_call":
+        tool_calls.append(event)
+        orch_status.info(f"🔍 Researched with {len(tool_calls)} tool call(s) — planning...")
 
-# ── Step 6: Shutdown ──────────────────────────────────────────────────────────
+    elif etype == "plan_chunk":
+        plan_text += event["text"]
+        orch_raw.code(plan_text + "▌", language="json")
 
-run_async(manager.shutdown())
+    elif etype == "plan_ready":
+        orch_raw.code(plan_text, language="json")
+        specs = event["specs"]
+        agent_names = [s["name"] for s in specs]
+        orch_status.success(f"Planned {len(specs)} agent(s)")
+
+        with orch_details:
+            if tool_calls:
+                st.markdown("#### 🔍 Research")
+                for tc in tool_calls:
+                    label = f"`{tc['tool']}({', '.join(f'{k}={v!r}' for k, v in tc['args'].items())})`"
+                    with st.expander(label):
+                        st.markdown(tc["result"])
+            st.markdown("#### Agent specs")
+            for spec in specs:
+                with st.expander(f"`{spec['name']}` — {spec['role_description']}"):
+                    st.markdown(f"**System prompt**\n\n{spec['system_prompt']}")
+                    if spec.get("tools"):
+                        st.markdown(f"**Tools:** {', '.join(spec['tools'])}")
+
+        # Agent legend in Tab 3
+        with agents_legend:
+            cols = st.columns(len(specs))
+            for i, spec in enumerate(specs):
+                color = _agent_color(spec["name"], agent_names)
+                cols[i].markdown(
+                    f'<span style="color:{color}; font-weight:700">● {spec["name"]}</span><br>'
+                    f'<span style="font-size:0.85em">{spec["role_description"]}</span>',
+                    unsafe_allow_html=True,
+                )
+
+        chat_status.info("⏳ Agents in conversation...")
+
+    elif etype == "agent_message":
+        conv_messages.append(event)
+        conv_display.markdown(
+            render_conversation(conv_messages, agent_names, None),
+            unsafe_allow_html=True,
+        )
+
+    elif etype == "stop_signal":
+        stop_signal = event
+        conv_display.markdown(
+            render_conversation(conv_messages, agent_names, stop_signal),
+            unsafe_allow_html=True,
+        )
+        chat_status.info("⏳ Synthesizing final report...")
+
+    elif etype == "synthesis_chunk":
+        synthesis_text += event["text"]
+        final_report.markdown(synthesis_text + "▌")
+
+    elif etype == "done":
+        final_report.markdown(synthesis_text)
+        chat_status.success("✅ Done")
+
+    elif etype == "error":
+        chat_status.error(f"Backend error: {event['message']}")
+        st.stop()
