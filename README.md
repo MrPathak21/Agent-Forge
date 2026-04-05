@@ -13,25 +13,38 @@ User goal
    │
    ▼
 Orchestrator          ← researches the goal (web_search, get_datetime)
-   │                    plans a bespoke team, writes each agent's system prompt
-   ▼
-AgentManager          ← spawns agents via the factory, tears them down after
-   └── AgentFactory   ← abstract: create / run / close agents
-         └── AutoGenFactory  ✅ (LangGraph + Anthropic stubs pending)
+   │                    chooses execution strategy, writes agent system prompts
+   │
+   ├─── strategy: autogen ────────────────────────────────────────────────────┐
+   │                                                                           │
+   │    AgentManager + AutoGenFactory                                          │
+   │      └── spawn N debate agents                                            │
+   │                                                                           │
+   │    AgentConversation   ← multi-round debate loop                          │
+   │      agents see full conversation history                                 │
+   │      orchestrator judges convergence after each round                     │
+   │      max_rounds safety cap prevents runaway loops                         │
+   │                                                                           │
+   └─── strategy: langgraph ──────────────────────────────────────────────────┤
+                                                                               │
+        LangGraphFactory                                                        │
+          └── spawn one agent per graph node                                   │
+                                                                               │
+        GraphRunner   ← builds a LangGraph StateGraph from the spec            │
+          nodes execute in order (sequential or parallel branches)             │
+          each node receives the goal + all upstream output as context         │
+                                                                               │
+   ┌───────────────────────────────────────────────────────────────────────────┘
    │
    ▼
-AgentConversation     ← multi-round debate loop
-   │                    agents see the full conversation history
-   │                    orchestrator judges convergence after each round
-   │                    max_rounds safety cap prevents runaway loops
-   ▼
-Orchestrator.synthesize  ← reads the full debate, writes the final report
+Orchestrator.synthesize  ← reads full execution output, writes final report
    │
    ▼
-FastAPI (SSE stream)  ← every event delivered in real time
-   │
+FastAPI (SSE stream)  ← every event streamed in real time
+   │                    detail=result | orchestration | full
    ▼
 Streamlit UI          ← 3 tabs: Chat · Orchestrator · Agent Activity
+                         Orchestrator tab shows graph edges for langgraph runs
 ```
 
 ---

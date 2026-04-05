@@ -15,8 +15,11 @@ Endpoints:
 """
 
 import json
+import logging
 from enum import Enum
 from typing import AsyncGenerator
+
+log = logging.getLogger("agent_forge")
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -101,23 +104,30 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
     - ``autogen``   → multi-round debate via AgentConversation
     - ``langgraph`` → structured pipeline via GraphRunner
     """
+    log.info("Pipeline started | goal=%r | provider=%s", req.goal[:80], req.provider)
     orchestrator = Orchestrator(provider=req.provider)
 
     # Phase 1: Research + plan
     plan: list[AgentSpec] | GraphSpec | None = None
     async for item in orchestrator.plan_stream(req.goal):
         if isinstance(item, OrchestratorToolCall):
+            log.info("[research] tool_call=%s args=%s", item.tool, item.args)
             yield "orchestrator_tool_call", json.dumps({
                 "tool": item.tool, "args": item.args, "result": item.result,
             })
         elif isinstance(item, GraphSpec):
             plan = item
+            node_names = [n.name for n in item.nodes]
+            edges = [(e.from_node, e.to_node) for e in item.edges]
+            log.info("[plan] strategy=langgraph nodes=%s edges=%s entry=%s",
+                     node_names, edges, item.entry)
             yield "plan_ready", json.dumps({
                 "strategy": "langgraph",
                 "spec": item.model_dump(by_alias=True),
             })
         elif isinstance(item, list):
             plan = item
+            log.info("[plan] strategy=autogen agents=%s", [s.name for s in item])
             yield "plan_ready", json.dumps({
                 "strategy": "autogen",
                 "specs": [s.model_dump() for s in item],
@@ -130,14 +140,17 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
 
     if isinstance(plan, GraphSpec):
         # ── LangGraph path ────────────────────────────────────────────────────
+        log.info("[execute] strategy=langgraph")
         factory = LangGraphFactory(provider=req.provider)
         runner = GraphRunner(factory=factory, spec=plan)
         async for item in runner.run_stream(req.goal):
             if isinstance(item, ConversationMessage):
+                log.info("[node] %s | %d chars", item.agent, len(item.content))
                 yield "agent_message", json.dumps({
                     "agent": item.agent, "content": item.content, "round": item.round,
                 })
             elif isinstance(item, StopSignal):
+                log.info("[stop] %s (by=%s)", item.reason, item.stopped_by)
                 yield "stop_signal", json.dumps({
                     "reason": item.reason, "stopped_by": item.stopped_by,
                 })
@@ -145,6 +158,7 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
 
     else:
         # ── AutoGen path (default) ────────────────────────────────────────────
+        log.info("[execute] strategy=autogen")
         specs: list[AgentSpec] = plan or []
         factory = AutoGenFactory(provider=req.provider)
         manager = AgentManager(factory)
@@ -156,6 +170,7 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
                 system_message=spec.system_prompt,
                 tools=spec.tools or None,
             )
+            log.info("[spawn] agent=%s tools=%s", spec.name, spec.tools)
             agents.append(agent)
 
         conversation = AgentConversation(
@@ -166,10 +181,12 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
         )
         async for item in conversation.run_stream(req.goal):
             if isinstance(item, ConversationMessage):
+                log.info("[round %d] %s | %d chars", item.round, item.agent, len(item.content))
                 yield "agent_message", json.dumps({
                     "agent": item.agent, "content": item.content, "round": item.round,
                 })
             elif isinstance(item, StopSignal):
+                log.info("[stop] %s (by=%s)", item.reason, item.stopped_by)
                 yield "stop_signal", json.dumps({
                     "reason": item.reason, "stopped_by": item.stopped_by,
                 })
@@ -177,11 +194,13 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
         context_source = conversation
 
     # Phase 4: Synthesize
+    log.info("[synthesize] building final report")
     synthesis_chunks: list[str] = []
     async for chunk in orchestrator.synthesize_stream(req.goal, context_source.to_context_text()):
         synthesis_chunks.append(chunk)
         yield "synthesis_chunk", json.dumps({"text": chunk})
 
+    log.info("[done] result_len=%d", sum(len(c) for c in synthesis_chunks))
     yield "done", json.dumps({"result": "".join(synthesis_chunks)})
 
 

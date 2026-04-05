@@ -84,7 +84,7 @@ where different perspectives improve the answer.
 — structured pipelines like research → analyse → draft → review, or workflows where \
 each step feeds the next.
 
-RETURN FORMAT — choose exactly one:
+RETURN a JSON object — choose exactly one of these formats:
 
 For autogen:
 {{
