@@ -10,35 +10,13 @@ from agent_forge.backends.autogen.agent import AutoGenAgent
 from agent_forge.config.settings import ProviderConfig, Settings
 from agent_forge.core.factory import AgentFactory
 
-# Role → system message
-_ROLE_PROMPTS: dict[str, str] = {
-    "general_assistant": (
-        "You are a concise, helpful AI assistant."
-    ),
-    "research_analyst": (
-        "You are a research analyst. Gather facts carefully, separate signal from noise, "
-        "and structure findings clearly."
-    ),
-    "market_strategist": (
-        "You are a market strategist. Form views with explicit reasoning, identify market "
-        "drivers, and compare bullish and bearish cases before concluding."
-    ),
-    "risk_reviewer": (
-        "You are a risk reviewer. Focus on downside, edge cases, invalid assumptions, "
-        "and failure modes. Challenge weak reasoning."
-    ),
-    "execution_planner": (
-        "You are an execution planner. Convert intent into concrete next steps, sequence "
-        "actions carefully, and keep plans realistic and measurable."
-    ),
-}
-
-_DEFAULT_ROLE = "general_assistant"
-
 
 class AutoGenFactory(AgentFactory):
     """
     Creates AutoGen AssistantAgents backed by an OpenAI-compatible model client.
+
+    Agents are fully defined by the system_message passed at creation time —
+    typically written by an Orchestrator for the specific task at hand.
 
     Args:
         provider: LLM provider name (only 'openai' is wired today).
@@ -64,20 +42,19 @@ class AutoGenFactory(AgentFactory):
 
     async def create(
         self,
-        role: str = _DEFAULT_ROLE,
+        role: str = "agent",
         name: str = "agent",
         *,
-        system_message: str | None = None,
+        system_message: str,
         tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AutoGenAgent:
         agent_id = str(uuid.uuid4())
-        resolved_system = system_message or _ROLE_PROMPTS.get(role, _ROLE_PROMPTS[_DEFAULT_ROLE])
 
         native = AssistantAgent(
             name=name,
             model_client=self._build_model_client(),
-            system_message=resolved_system,
+            system_message=system_message,
             tools=tools or [],
         )
 

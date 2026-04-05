@@ -3,9 +3,8 @@ from __future__ import annotations
 """
 agent-forge demo entrypoint.
 
-Spins up two agents via the AutoGen backend, runs tasks on each,
-then cleanly shuts everything down. Swap AutoGenFactory for
-LangGraphFactory or AnthropicFactory once those backends are wired.
+The Orchestrator decides what agents are needed for a given goal and writes
+their system prompts. The manager then spawns, runs, and kills those agents.
 
 Run:
     python -m agent_forge
@@ -16,40 +15,59 @@ import logging
 
 from agent_forge.backends.autogen import AutoGenFactory
 from agent_forge.core.manager import AgentManager
+from agent_forge.core.orchestrator import Orchestrator
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 
+GOAL = (
+    "Analyse the impact of rising US interest rates on emerging market equities "
+    "and produce a concise investment brief."
+)
+
+# One task per agent — keyed by agent name as returned by the orchestrator.
+TASKS: dict[str, str] = {
+    # The orchestrator may return different agent names depending on the goal.
+    # These tasks are matched to agents by name at runtime; unmatched agents
+    # receive the goal itself as their task.
+}
+
+
 async def run() -> None:
+    orchestrator = Orchestrator(provider="openai")
     factory = AutoGenFactory(provider="openai")
     manager = AgentManager(factory)
 
     print("\n=== agent-forge demo ===\n")
+    print(f"Goal: {GOAL}\n")
 
-    # Spawn two specialised agents
-    analyst = await manager.spawn(role="research_analyst", name="analyst")
-    strategist = await manager.spawn(role="market_strategist", name="strategist")
+    # --- Plan ---
+    print("Orchestrator planning agents...\n")
+    specs = await orchestrator.plan(GOAL)
 
-    print(f"Active agents: {[a.name for a in manager.list_agents()]}\n")
+    for spec in specs:
+        print(f"  [{spec.name}] {spec.role_description}")
+    print()
 
-    # Run tasks
-    answer1 = await manager.run_task(
-        analyst.agent_id,
-        "What are the key factors that drive inflation?",
-    )
-    print(f"[analyst] {answer1}\n")
+    # --- Spawn ---
+    agents = []
+    for spec in specs:
+        agent = await manager.spawn(
+            role=spec.role_description,
+            name=spec.name,
+            system_message=spec.system_prompt,
+        )
+        agents.append((spec, agent))
 
-    answer2 = await manager.run_task(
-        strategist.agent_id,
-        "Given rising inflation, what is the bullish and bearish case for equities?",
-    )
-    print(f"[strategist] {answer2}\n")
+    print(f"Active agents: {[a.name for _, a in agents]}\n")
 
-    # Release one agent mid-session
-    await manager.release(analyst.agent_id)
-    print(f"After releasing analyst — active: {[a.name for a in manager.list_agents()]}\n")
+    # --- Run ---
+    for spec, agent in agents:
+        task = TASKS.get(spec.name, GOAL)
+        result = await manager.run_task(agent.agent_id, task)
+        print(f"[{spec.name}]\n{result}\n")
 
-    # Shutdown everything
+    # --- Kill ---
     await manager.shutdown()
     print("All agents shut down cleanly.")
 

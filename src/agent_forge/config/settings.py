@@ -38,6 +38,10 @@ class ProviderConfig:
     base_url: str | None = None
     extra: dict[str, str] = field(default_factory=dict)
 
+    def __repr__(self) -> str:
+        masked = f"{self.api_key[:6]}...{self.api_key[-4:]}" if len(self.api_key) > 10 else "***"
+        return f"ProviderConfig(provider={self.provider!r}, api_key={masked!r}, model={self.model!r}, base_url={self.base_url!r})"
+
 
 class Settings:
     """

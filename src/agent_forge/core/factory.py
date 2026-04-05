@@ -22,11 +22,13 @@ class AgentFactory(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def create(self, role: str, name: str, **kwargs: Any) -> BaseAgent:
+    async def create(self, role: str, name: str, *, system_message: str, **kwargs: Any) -> BaseAgent:
         """
         Instantiate and register a new agent.
 
         Implementations must add the agent to self._agents and return it.
+        The system_message defines the agent's behaviour and is typically
+        written by an Orchestrator for the specific task at hand.
         """
 
     # ------------------------------------------------------------------
