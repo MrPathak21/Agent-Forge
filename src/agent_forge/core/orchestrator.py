@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI
@@ -10,6 +11,14 @@ from agent_forge.config.settings import ProviderConfig, Settings
 
 if TYPE_CHECKING:
     from agent_forge.core.shared_thread import SharedThread
+
+
+@dataclass
+class OrchestratorToolCall:
+    """Emitted during plan_stream when the orchestrator calls a tool."""
+    tool: str
+    args: dict
+    result: str
 
 
 class AgentSpec(BaseModel):
@@ -87,19 +96,86 @@ class Orchestrator:
         data = json.loads(response.choices[0].message.content)
         return [AgentSpec(**spec) for spec in data["agents"]]
 
+    _RESEARCH_SYSTEM = (
+        "You are a research assistant helping an AI orchestration planner stay current. "
+        "Use the available tools to gather a small amount of targeted, relevant context "
+        "for the goal — current date, recent news, or key facts. "
+        "Make 1-3 focused tool calls, then stop."
+    )
+
+    # Tools the orchestrator is allowed to use
+    _ORCHESTRATOR_TOOLS = ["web_search", "get_datetime"]
+
+    async def _research(self, goal: str) -> tuple[list[OrchestratorToolCall], str]:
+        """
+        Run a tool-calling loop to gather current context for the goal.
+        Returns (tool_calls_made, research_summary_text).
+        """
+        from agent_forge.tools import get_tool, get_openai_schemas
+
+        tool_schemas = get_openai_schemas(self._ORCHESTRATOR_TOOLS)
+        messages: list[dict] = [
+            {"role": "system", "content": self._RESEARCH_SYSTEM},
+            {"role": "user", "content": f"Gather current context for: {goal}"},
+        ]
+        tool_calls_made: list[OrchestratorToolCall] = []
+
+        for _ in range(4):  # safety cap on rounds
+            response = await self._client().chat.completions.create(
+                model=self._config.model,
+                messages=messages,
+                tools=tool_schemas,
+                tool_choice="auto",
+            )
+            msg = response.choices[0].message
+
+            if not msg.tool_calls:
+                break
+
+            messages.append(msg)
+            for tc in msg.tool_calls:
+                fn = get_tool(tc.function.name)
+                args = json.loads(tc.function.arguments)
+                result = fn(**args)
+                tool_calls_made.append(
+                    OrchestratorToolCall(tool=tc.function.name, args=args, result=result)
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+        research_text = "\n\n".join(
+            f"[{tc.tool}({', '.join(f'{k}={v}' for k, v in tc.args.items())})]\n{tc.result}"
+            for tc in tool_calls_made
+        )
+        return tool_calls_made, research_text
+
     async def plan_stream(self, goal: str):
         """
         Async generator for live UI display.
-        Yields str chunks while the LLM is writing the plan, then yields
-        list[AgentSpec] as the final item once the response is complete.
+        Phase 1 — yields OrchestratorToolCall as the orchestrator researches.
+        Phase 2 — yields str chunks as the plan JSON streams.
+        Phase 3 — yields list[AgentSpec] as the final item.
         """
+        # Phase 1: research
+        tool_calls, research_text = await self._research(goal)
+        for tc in tool_calls:
+            yield tc
+
+        # Phase 2 + 3: stream plan with research context injected
+        user_content = f"Goal: {goal}"
+        if research_text:
+            user_content += f"\n\nCurrent context from research:\n{research_text}"
+
         stream = await self._client().chat.completions.create(
             model=self._config.model,
             response_format={"type": "json_object"},
             stream=True,
             messages=[
                 {"role": "system", "content": self._build_system_prompt()},
-                {"role": "user", "content": f"Goal: {goal}"},
+                {"role": "user", "content": user_content},
             ],
         )
         chunks: list[str] = []

@@ -16,7 +16,7 @@ import streamlit as st
 from agent_forge.backends.autogen import AutoGenFactory
 from agent_forge.core.conversation import AgentConversation, ConversationMessage, StopSignal
 from agent_forge.core.manager import AgentManager
-from agent_forge.core.orchestrator import AgentSpec, Orchestrator
+from agent_forge.core.orchestrator import AgentSpec, Orchestrator, OrchestratorToolCall
 
 # ── Async helpers ─────────────────────────────────────────────────────────────
 
@@ -161,14 +161,24 @@ if not run_btn:
 # ── Step 1: Stream orchestrator planning → Tab 2 ─────────────────────────────
 
 chat_status.info("⏳ Planning agents...")
-orch_status.info("Planning agents for your goal...")
+orch_status.info("Researching goal...")
 
 full_text = ""
 specs: list[AgentSpec] = []
+tool_calls_made: list[OrchestratorToolCall] = []
 orchestrator = Orchestrator(provider="openai")
 
 for item in iter_async_stream(lambda: orchestrator.plan_stream(goal)):
-    if isinstance(item, list):
+    if isinstance(item, OrchestratorToolCall):
+        tool_calls_made.append(item)
+        # Show research progress live
+        with orch_specs_area:
+            st.markdown("#### 🔍 Research")
+            for tc in tool_calls_made:
+                with st.expander(f"`{tc.tool}({', '.join(f'{k}={v!r}' for k, v in tc.args.items())})`"):
+                    st.markdown(tc.result)
+        orch_status.info(f"Researched with {len(tool_calls_made)} tool call(s) — now planning...")
+    elif isinstance(item, list):
         specs = item
     else:
         full_text += item
@@ -178,6 +188,11 @@ orch_raw.code(full_text, language="json")
 orch_status.success(f"Planned {len(specs)} agent(s)")
 
 with orch_specs_area:
+    if tool_calls_made:
+        st.markdown("#### 🔍 Research")
+        for tc in tool_calls_made:
+            with st.expander(f"`{tc.tool}({', '.join(f'{k}={v!r}' for k, v in tc.args.items())})`"):
+                st.markdown(tc.result)
     st.markdown("#### Agent specs")
     for spec in specs:
         with st.expander(f"`{spec.name}` — {spec.role_description}"):

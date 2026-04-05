@@ -8,6 +8,7 @@ The registry is lazy-loaded — all tool modules are imported on first access.
 """
 
 import importlib
+import inspect
 from typing import Callable
 
 _REGISTRY: dict[str, Callable] = {}
@@ -70,3 +71,41 @@ def get_tools(names: list[str]) -> list[Callable]:
             import warnings
             warnings.warn(f"Tool {name!r} not found in registry — skipping.")
     return resolved
+
+
+_TYPE_MAP: dict = {int: "integer", float: "number", bool: "boolean", str: "string"}
+
+
+def to_openai_schema(fn: Callable) -> dict:
+    """Convert a registered tool function to OpenAI's function calling schema."""
+    sig = inspect.signature(fn)
+    doc = inspect.getdoc(fn) or ""
+    name = getattr(fn, "_tool_name", fn.__name__)
+
+    properties: dict = {}
+    required: list[str] = []
+
+    for param_name, param in sig.parameters.items():
+        json_type = _TYPE_MAP.get(param.annotation, "string")
+        properties[param_name] = {"type": json_type}
+        if param.default is inspect.Parameter.empty:
+            required.append(param_name)
+
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": doc,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
+def get_openai_schemas(names: list[str]) -> list[dict]:
+    """Return OpenAI function schemas for the given tool names."""
+    _ensure_loaded()
+    return [to_openai_schema(_REGISTRY[n]) for n in names if n in _REGISTRY]
