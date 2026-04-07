@@ -16,6 +16,12 @@ User goal
    │                              emits goal_clarified (was_changed + reasoning)
    │
    ▼
+Orchestrator scores goal      ← reasoning_score vs workflow_score (0-10 each)
+   │                              rule-based override if confidence < 0.7
+   │                              emits plan_ready with scores + confidence
+   │                              emits goal_clarified (was_changed + reasoning)
+   │
+   ▼
 Orchestrator research         ← get_datetime (always) + web_search as needed
    │                              runs ONCE — not repeated on plan retries
    │
@@ -49,9 +55,10 @@ Orchestrator research         ← get_datetime (always) + web_search as needed
           mode B — sequential / conditional pipeline (edges defined):          │
             nodes execute in order defined by edges                            │
             each node receives the goal + all upstream output as context       │
-            conditional edges: node embeds [ROUTE: KEY] in response            │
-            GraphRunner extracts key, routes to matching next node             │
-            tag stripped from content before display / synthesis               │
+            conditional edges: node emits {"route": "KEY"} JSON               │
+            GraphRunner validates key against known edges, routes accordingly  │
+            routing JSON stripped from content before display / synthesis      │
+            retry on invalid output — fallback placeholder after 1 failed retry│
                                                                                │
    ┌───────────────────────────────────────────────────────────────────────────┘
    │
@@ -301,6 +308,57 @@ The SSE event stream, Streamlit UI, and synthesis phase are identical for both s
 
 ---
 
+## Strategy selection
+
+The orchestrator scores every goal on two dimensions before choosing a strategy:
+
+| Score | What it measures |
+|---|---|
+| `reasoning_score` (0-10) | How much agents benefit from debating and challenging each other |
+| `workflow_score` (0-10) | How clearly the goal maps to distinct, ordered stages or parallel sub-tasks |
+
+The strategy with the higher score wins. If scores are within 2 points, autogen is preferred. When LLM confidence is below 0.7, a keyword-based override kicks in — goals containing words like *extract*, *pipeline*, *sequential* bias toward langgraph; words like *debate*, *compare*, *recommend* bias toward autogen.
+
+The `plan_ready` SSE event includes the scores and confidence:
+
+```json
+{
+  "strategy": "autogen",
+  "reasoning_score": 8,
+  "workflow_score": 3,
+  "multi_agent_needed": true,
+  "confidence": 0.85
+}
+```
+
+---
+
+## Conditional routing
+
+LangGraph nodes with conditional outgoing edges signal their route via a JSON object on its own line at the end of their response:
+
+```json
+{"route": "HIGH_RISK"}
+```
+
+GraphRunner extracts the key, validates it against the node's known outgoing edges, and routes accordingly. If the key is missing or invalid, the unconditional edge (or END) is used as fallback. The routing JSON is stripped from content before display or synthesis.
+
+This replaces the previous `[ROUTE: KEY]` tag format.
+
+---
+
+## Failure handling
+
+Every agent and graph node is wrapped with a single retry on invalid output:
+
+1. Agent runs and produces output
+2. If output is empty or below the minimum length threshold → retry once
+3. If retry also fails → a safe fallback placeholder is used so the pipeline never silently propagates bad output
+
+Thresholds: 50 characters for graph nodes, 20 characters for debate agents.
+
+---
+
 ## Quality guardrails
 
 Four LLM-based guardrails run automatically on every request — no configuration needed.
@@ -353,4 +411,5 @@ The manager, orchestrator, conversation loop, graph runner, and API layer are al
 
 - Anthropic backend implementation
 - Additional tools (code executor, news API, etc.)
+- Context compression for long agent conversations
 - Authentication / multi-user support

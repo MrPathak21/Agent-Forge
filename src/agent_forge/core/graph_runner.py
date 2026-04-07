@@ -12,10 +12,17 @@ and yields the same ``ConversationMessage`` / ``StopSignal`` events as
 ``AgentConversation`` so the API and Streamlit layers need no changes.
 
 Conditional routing:
-    Nodes signal their route by including ``[ROUTE: KEY]`` at the end of their
-    response.  GraphRunner extracts the key, matches it to the outgoing
-    conditional edges, and routes accordingly.  The tag is stripped from the
-    content before it is displayed or passed to the synthesis phase.
+    Nodes signal their route via a JSON object on its own line:
+    {"route": "CONDITION_KEY"}
+    GraphRunner extracts the key, validates it against known outgoing edges,
+    and routes accordingly. Falls back to the unconditional edge (or END) if
+    the key is missing or invalid. The routing JSON is stripped from content
+    before display or synthesis.
+
+Failure handling:
+    Each node is retried once on invalid/empty output. After a failed retry,
+    a safe fallback message is used so the pipeline never silently propagates
+    bad output.
 """
 
 import logging
@@ -32,20 +39,43 @@ if TYPE_CHECKING:
     from agent_forge.core.factory import AgentFactory
     from agent_forge.core.orchestrator import GraphSpec
 
-# Matches [ROUTE: SOME_KEY] anywhere in a string (case-insensitive)
-_ROUTE_TAG = re.compile(r"\[ROUTE:\s*(\w+)\]", re.IGNORECASE)
-_ROUTE_STRIP = re.compile(r"\[ROUTE:\s*\w+\]", re.IGNORECASE)
+# Matches {"route": "SOME_KEY"} anywhere in a string (case-insensitive)
+_ROUTE_JSON = re.compile(r'\{[^{}]*"route"\s*:\s*"(\w+)"[^{}]*\}', re.IGNORECASE)
+_ROUTE_STRIP = re.compile(r'\{[^{}]*"route"\s*:\s*"\w+"[^{}]*\}', re.IGNORECASE)
+
+_MIN_OUTPUT_LENGTH = 50  # characters — below this is considered invalid
 
 
 def _extract_route(content: str) -> str | None:
-    """Return the uppercase route key from a [ROUTE: KEY] tag, or None."""
-    m = _ROUTE_TAG.search(content)
+    """Return the uppercase route key from a {\"route\": \"KEY\"} JSON object, or None."""
+    m = _ROUTE_JSON.search(content)
     return m.group(1).upper() if m else None
 
 
 def _strip_route(content: str) -> str:
-    """Remove [ROUTE: KEY] tags from content before display / synthesis."""
+    """Remove routing JSON from content before display / synthesis."""
     return _ROUTE_STRIP.sub("", content).strip()
+
+
+def _is_valid_output(content: str) -> bool:
+    """Return True if the output is non-empty and meets the minimum length threshold."""
+    return len((content or "").strip()) >= _MIN_OUTPUT_LENGTH
+
+
+async def _run_with_retry(agent: Any, task: str, label: str) -> str:
+    """
+    Run an agent task with a single retry on invalid output.
+    Falls back to a safe placeholder if both attempts fail.
+    """
+    content = await agent.run(task)
+    if _is_valid_output(content):
+        return content
+    log.warning("[%s] invalid output (len=%d) — retrying", label, len(content or ""))
+    content = await agent.run(task)
+    if _is_valid_output(content):
+        return content
+    log.error("[%s] failed after retry — using fallback", label)
+    return f"[{label}: failed to produce valid output after retry]"
 
 
 class _AgentState(TypedDict):
@@ -106,10 +136,16 @@ class GraphRunner:
             )
             agents[node.name] = agent
 
+        # ── Build conditional routes map (node → valid route keys) ──────────────
+        conditional_routes_map: dict[str, list[str]] = defaultdict(list)
+        for edge in self._spec.edges:
+            if edge.condition_key:
+                conditional_routes_map[edge.from_node].append(edge.condition_key.upper())
+
         # ── Build node functions ──────────────────────────────────────────────
         node_task_map = {n.name: n.task_prompt for n in self._spec.nodes}
 
-        def _make_node_fn(agent: Any, node_name: str):
+        def _make_node_fn(agent: Any, node_name: str, valid_routes: list[str]):
             async def node_fn(state: _AgentState) -> dict:
                 task = node_task_map[node_name]
                 context = "\n\n".join(
@@ -118,18 +154,30 @@ class GraphRunner:
                 )
                 if context:
                     task += f"\n\nWork completed so far:\n{context}"
-                # Keep raw content in state so the router can read [ROUTE:] tags
-                content = await agent.run(task)
+                if valid_routes:
+                    routes_str = ", ".join(f'"{r}"' for r in valid_routes)
+                    task += (
+                        f"\n\nEnd your response with a routing decision as a JSON object "
+                        f"on its own line:\n"
+                        f'{{\"route\": \"<chosen_route>\"}}\n'
+                        f"Valid routes: {routes_str}\n"
+                        f"Choose the route that best matches your analysis."
+                    )
+                # Raw content kept in state so router can read {"route": ...} JSON
+                content = await _run_with_retry(agent, task, node_name)
                 return {"messages": [{"agent": node_name, "content": content}]}
             return node_fn
 
         for node in self._spec.nodes:
-            workflow.add_node(node.name, _make_node_fn(agents[node.name], node.name))
+            workflow.add_node(
+                node.name,
+                _make_node_fn(agents[node.name], node.name, conditional_routes_map[node.name]),
+            )
 
         # ── No edges → parallel independent execution ─────────────────────────
         if not self._spec.edges:
             for node in self._spec.nodes:
-                content = await agents[node.name].run(node.task_prompt)
+                content = await _run_with_retry(agents[node.name], node.task_prompt, node.name)
                 clean = _strip_route(content)
                 self._messages.append({"agent": node.name, "content": clean})
                 yield ConversationMessage(agent=node.name, content=clean, round=1)

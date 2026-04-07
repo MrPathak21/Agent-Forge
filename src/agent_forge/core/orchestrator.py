@@ -84,15 +84,25 @@ class Orchestrator:
 You are an agent orchestration planner. Given a goal, choose the best execution \
 strategy and plan a team of AI agents to accomplish it.
 
+STRATEGY SCORING — before choosing, score the goal on two dimensions (0-10):
+- reasoning_score: how much benefit agents get from debating, challenging each other, \
+and iterating on a shared answer. High for open-ended analysis, opinions, comparisons. \
+Low for extraction, parsing, or tasks with a single correct answer.
+- workflow_score: how clearly the goal maps to distinct, ordered stages or parallel \
+independent sub-tasks. High when there are obvious steps or branches. Low for \
+exploratory or conversational goals.
+
+Choose the strategy with the higher score. If scores are close (within 2 points), \
+prefer autogen. Also set multi_agent_needed (true if >1 agent adds value) and \
+confidence (0-1, your certainty in the strategy choice).
+
 STRATEGY CHOICE:
-- autogen: Use when the goal benefits from agents debating, challenging each other, \
-and converging on an answer — open-ended analysis, opinions, comparisons, or problems \
-where different perspectives improve the result.
-- langgraph: Use when the goal has a clear deterministic structure. Two valid cases: \
+- autogen: Use when reasoning_score > workflow_score — agents debating and challenging \
+each other improves the result. Open-ended analysis, opinions, comparisons, recommendations.
+- langgraph: Use when workflow_score > reasoning_score. Two valid cases: \
 (1) PARALLEL INDEPENDENT — multiple agents each handle a completely separate sub-task \
-with no need to see each other's output (e.g. analyse 5 companies simultaneously); \
-(2) CONDITIONAL PIPELINE — a node's output determines which path to take next \
-(e.g. assess risk first, then route to crisis analysis if HIGH or recommendation if LOW). \
+with no need to see each other's output; \
+(2) CONDITIONAL PIPELINE — a node's output determines which path to take next. \
 Do NOT use langgraph just because a task sounds sequential — if agents benefit from \
 debating each other's findings, use autogen.
 
@@ -101,6 +111,10 @@ RETURN a JSON object — choose exactly one of these formats:
 For autogen:
 {{
   "strategy": "autogen",
+  "reasoning_score": 8,
+  "workflow_score": 3,
+  "multi_agent_needed": true,
+  "confidence": 0.85,
   "agents": [
     {{
       "name": "snake_case_name",
@@ -114,6 +128,10 @@ For autogen:
 For langgraph:
 {{
   "strategy": "langgraph",
+  "reasoning_score": 3,
+  "workflow_score": 9,
+  "multi_agent_needed": true,
+  "confidence": 0.90,
   "nodes": [
     {{
       "name": "snake_case_name",
@@ -132,14 +150,15 @@ For langgraph:
 }}
 
 Rules:
-- For langgraph: if nodes are fully independent (e.g. each analyses a different company
-  with no need to see each other's output), leave "edges" as an empty array []. Each
+- For langgraph: if nodes are fully independent, leave "edges" as an empty array []. Each
   node will receive only its own task_prompt — no shared context. If stages must build
-  on each other (e.g. researcher feeds analyst), define edges explicitly.
+  on each other, define edges explicitly.
 - Conditional edges: add "condition" (human-readable) and "condition_key" (short
   uppercase token e.g. "HIGH_RISK") to an edge to make it conditional. When a node
-  has conditional outgoing edges, its system_prompt MUST end with routing instructions
-  like: "End your response with [ROUTE: HIGH_RISK] if ... or [ROUTE: LOW_RISK] if ...".
+  has conditional outgoing edges, its system_prompt MUST include routing instructions:
+  "End your response with a routing decision as a JSON object on its own line:
+  {{\\"route\\": \\"HIGH_RISK\\"}} if ... or {{\\"route\\": \\"LOW_RISK\\"}} if ..."
+  The route value must exactly match the condition_key of the chosen edge (uppercase).
   Include one unconditional edge from the same node as the fallback.
 - tools: choose ONLY from the available tools listed below. Empty list if none needed.
 - Only create agents/nodes that are genuinely necessary.
@@ -154,6 +173,37 @@ Available tools:
         from agent_forge.tools import list_tools
         tools_str = "\n".join(f"  - {t}" for t in list_tools())
         return self._SYSTEM_BASE.format(tools_list=tools_str)
+
+    @staticmethod
+    def _apply_strategy_overrides(data: dict, goal: str) -> dict:
+        """
+        Rule-based strategy override applied when LLM confidence is low (< 0.7).
+        Keyword signals in the goal are used to correct uncertain decisions.
+        Does nothing when the LLM is confident.
+        """
+        if data.get("confidence", 1.0) >= 0.7:
+            return data
+
+        goal_lower = goal.lower()
+        LG_KEYWORDS = frozenset({
+            "extract", "parse", "pipeline", "sequential", "stages",
+            "workflow", "structured", "step by step", "scrape", "generate report",
+        })
+        AG_KEYWORDS = frozenset({
+            "debate", "compare", "opinion", "recommend", "should i",
+            "better", "best", "pros and cons", "vs", "versus", "analyse",
+        })
+        lg_hits = sum(1 for kw in LG_KEYWORDS if kw in goal_lower)
+        ag_hits = sum(1 for kw in AG_KEYWORDS if kw in goal_lower)
+
+        if lg_hits > ag_hits and data.get("strategy") != "langgraph":
+            data["strategy"] = "langgraph"
+            data["override_reason"] = f"keyword override: langgraph signals={lg_hits}, autogen signals={ag_hits}"
+        elif ag_hits > lg_hits and data.get("strategy") != "autogen":
+            data["strategy"] = "autogen"
+            data["override_reason"] = f"keyword override: autogen signals={ag_hits}, langgraph signals={lg_hits}"
+
+        return data
 
     def __init__(self, provider: str = "openai", *, model: str | None = None) -> None:
         self._config: ProviderConfig = Settings.for_provider(provider, model=model)
@@ -288,7 +338,7 @@ Available tools:
                 chunks.append(text)
                 yield text
 
-        data = json.loads("".join(chunks))
+        data = self._apply_strategy_overrides(json.loads("".join(chunks)), goal)
         if data.get("strategy") == "langgraph":
             yield GraphSpec(
                 nodes=[GraphNode(**n) for n in data["nodes"]],
@@ -375,14 +425,24 @@ Available tools:
         "contradictions, and present the most important insights clearly and concisely."
     )
 
-    _STOP_SYSTEM = (
-        "You are a conversation moderator. Given the goal and the conversation history "
-        "between AI agents, decide if the agents have converged enough to stop.\n\n"
-        "Return JSON: {\"converged\": true/false, \"reason\": \"brief explanation\"}\n\n"
-        "Stop if: agents have reached agreement or complementary conclusions, the goal "
-        "is adequately addressed, or further rounds would add little value.\n"
-        "Continue if: there are unresolved disagreements worth exploring, important "
-        "aspects of the goal are uncovered, or agents have raised new questions."
+    _CONVERGENCE_SYSTEM = (
+        "You are a convergence judge for a multi-agent debate. After each round you decide "
+        "whether agents have genuinely converged or should keep debating.\n\n"
+        "You receive the goal, structured positions from the CURRENT round, structured "
+        "positions from the PREVIOUS round (empty if first check), and the full conversation.\n\n"
+        "Evaluate THREE things:\n"
+        "1. ALIGNMENT — are all agents' positions semantically the same or complementary? "
+        "Flag if any agent holds a materially different stance.\n"
+        "2. NOVELTY — did any agent introduce a meaningfully new fact, argument, or concern "
+        "compared to the previous round? Repetition and paraphrasing do NOT count as new.\n"
+        "3. CONFIDENCE — is the average confidence across agents >= 0.7?\n\n"
+        "Converge ONLY IF: positions are aligned AND no major new information emerged "
+        "AND average confidence >= 0.7.\n"
+        "Continue IF: any agent disagrees, new substantive information emerged, or "
+        "confidence is low.\n\n"
+        "Return JSON: {\"converged\": true|false, \"reason\": \"one sentence explanation\", "
+        "\"checks\": {\"aligned\": true|false, \"no_new_info\": true|false, "
+        "\"confidence_sufficient\": true|false}}"
     )
 
     async def synthesize_stream(self, goal: str, context: SharedThread | str, feedback: str | None = None):
@@ -410,21 +470,76 @@ Available tools:
             if text:
                 yield text
 
-    async def should_stop(self, goal: str, history_text: str) -> tuple[bool, str]:
-        """
-        After each conversation round, judge whether agents have converged.
-        Returns (converged: bool, reason: str).
-        """
+    async def _should_stop_simple(self, goal: str, history_text: str) -> tuple[bool, str]:
+        """Fallback convergence check used when agents produce no position blocks."""
         response = await self._client().chat.completions.create(
             model=self._config.model,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": self._STOP_SYSTEM},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a conversation moderator. Given the goal and the conversation "
+                        "history between AI agents, decide if the agents have converged enough to stop.\n\n"
+                        "Return JSON: {\"converged\": true/false, \"reason\": \"brief explanation\"}\n\n"
+                        "Stop if: agents have reached agreement or complementary conclusions, the goal "
+                        "is adequately addressed, or further rounds would add little value.\n"
+                        "Continue if: there are unresolved disagreements worth exploring, important "
+                        "aspects of the goal are uncovered, or agents have raised new questions."
+                    ),
+                },
                 {"role": "user", "content": f"Goal: {goal}\n\n{history_text}"},
             ],
         )
         data = json.loads(response.choices[0].message.content)
         return data["converged"], data["reason"]
+
+    async def convergence_check(
+        self,
+        goal: str,
+        round_num: int,
+        current_positions: list[dict],
+        previous_positions: list[dict],
+        history_text: str,
+        min_rounds: int = 2,
+    ) -> tuple[bool, str]:
+        """
+        Hybrid convergence check. Returns (should_stop, reason).
+
+        Enforces a minimum round count, then evaluates three criteria:
+        - Position alignment across agents
+        - Novelty vs the previous round (repetition ≠ convergence)
+        - Average confidence >= 0.7
+
+        Falls back to simple prompt-based check if no position blocks were extracted.
+        """
+        if round_num < min_rounds:
+            return False, f"Minimum {min_rounds} rounds not yet reached."
+
+        if not current_positions:
+            return await self._should_stop_simple(goal, history_text)
+
+        user_content = (
+            f"Goal: {goal}\n\n"
+            f"Round: {round_num}\n\n"
+            f"Current round positions:\n{json.dumps(current_positions, indent=2)}\n\n"
+            f"Previous round positions:\n"
+            f"{json.dumps(previous_positions, indent=2) if previous_positions else 'N/A (first check)'}\n\n"
+            f"Full conversation:\n{history_text}"
+        )
+        try:
+            response = await self._client().chat.completions.create(
+                model=self._config.model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": self._CONVERGENCE_SYSTEM},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            data = json.loads(response.choices[0].message.content)
+            return data["converged"], data["reason"]
+        except Exception:
+            return await self._should_stop_simple(goal, history_text)
 
     # ── Quality guardrails ────────────────────────────────────────────────────
 
