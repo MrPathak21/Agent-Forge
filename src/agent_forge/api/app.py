@@ -112,6 +112,9 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
     orchestrator = Orchestrator(provider=req.provider)
 
     # ── Guardrail 1: Goal Clarity ─────────────────────────────────────────────
+    # NOTE: effective_goal is used for planning/orchestration only.
+    # The original req.goal (which may carry raw data like transcripts) is
+    # passed to agent execution so agents always have access to the full payload.
     log.info("[guardrail:goal_clarity] checking goal specificity")
     clarity = await orchestrator.clarify_goal(req.goal)
     effective_goal = clarity["clarified_goal"]
@@ -189,7 +192,7 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
         log.info("[execute] strategy=langgraph")
         factory = LangGraphFactory(provider=req.provider)
         runner = GraphRunner(factory=factory, spec=plan)
-        async for item in runner.run_stream(effective_goal):
+        async for item in runner.run_stream(req.goal):
             if isinstance(item, ConversationMessage):
                 log.info("[node] %s | %d chars", item.agent, len(item.content))
                 yield "agent_message", json.dumps({
@@ -214,6 +217,7 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
                 name=spec.name,
                 system_message=spec.system_prompt,
                 tools=spec.tools or None,
+                model=spec.model or None,
             )
             log.info("[spawn] agent=%s tools=%s", spec.name, spec.tools)
             agents.append(agent)
@@ -224,7 +228,7 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
             orchestrator=orchestrator,
             max_rounds=req.max_rounds,
         )
-        async for item in conversation.run_stream(effective_goal):
+        async for item in conversation.run_stream(req.goal):
             if isinstance(item, ConversationMessage):
                 log.info("[round %d] %s | %d chars", item.round, item.agent, len(item.content))
                 yield "agent_message", json.dumps({

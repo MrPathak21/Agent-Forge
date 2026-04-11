@@ -35,6 +35,7 @@ class LangGraphFactory(AgentFactory):
         *,
         system_message: str,
         tools: list[str] | None = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> LangGraphAgent:
         from langchain_openai import ChatOpenAI
@@ -42,7 +43,7 @@ class LangGraphFactory(AgentFactory):
         from agent_forge.tools import get_tools
 
         kwargs_llm: dict[str, Any] = {
-            "model": self._config.model,
+            "model": model or self._config.model,
             "api_key": self._config.api_key,
         }
         if self._config.base_url:

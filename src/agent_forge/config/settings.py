@@ -9,9 +9,16 @@ load_dotenv()
 
 SUPPORTED_PROVIDERS = ("openai", "anthropic", "gemini")
 
-# Default models per provider
+# Default models per provider (used for agents)
 _DEFAULTS: dict[str, str] = {
-    "openai": "gpt-4.1-mini",
+    "openai": "gpt-5.4-mini",
+    "anthropic": "claude-sonnet-4-6",
+    "gemini": "gemini-2.5-flash",
+}
+
+# Orchestrator models — most critical work (planning, convergence, synthesis, guardrails).
+_ORCHESTRATOR_DEFAULTS: dict[str, str] = {
+    "openai": "gpt-5.4-mini",
     "anthropic": "claude-sonnet-4-6",
     "gemini": "gemini-2.5-flash",
 }
@@ -53,30 +60,41 @@ class Settings:
     """
 
     @classmethod
+    def _resolve(cls, provider: str, model: str | None, defaults: dict[str, str]) -> ProviderConfig:
+        provider = provider.strip().lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"Unsupported provider: {provider!r}. Choose from {SUPPORTED_PROVIDERS}."
+            )
+        api_key = os.getenv(_API_KEY_ENV[provider], "").strip()
+        if not api_key:
+            raise ValueError(
+                f"{_API_KEY_ENV[provider]} is not set. Add it to your .env file."
+            )
+        base_url = os.getenv(_BASE_URL_ENV[provider], "").strip() or None
+        return ProviderConfig(
+            provider=provider,
+            api_key=api_key,
+            model=model or defaults[provider],
+            base_url=base_url,
+        )
+
+    @classmethod
     def for_provider(
         cls,
         provider: str = "openai",
         *,
         model: str | None = None,
     ) -> ProviderConfig:
-        provider = provider.strip().lower()
-        if provider not in SUPPORTED_PROVIDERS:
-            raise ValueError(
-                f"Unsupported provider: {provider!r}. Choose from {SUPPORTED_PROVIDERS}."
-            )
+        """Config for agents — uses agent-tier model defaults."""
+        return cls._resolve(provider, model, _DEFAULTS)
 
-        api_key = os.getenv(_API_KEY_ENV[provider], "").strip()
-        if not api_key:
-            raise ValueError(
-                f"{_API_KEY_ENV[provider]} is not set. Add it to your .env file."
-            )
-
-        base_url = os.getenv(_BASE_URL_ENV[provider], "").strip() or None
-        resolved_model = model or _DEFAULTS[provider]
-
-        return ProviderConfig(
-            provider=provider,
-            api_key=api_key,
-            model=resolved_model,
-            base_url=base_url,
-        )
+    @classmethod
+    def for_orchestrator(
+        cls,
+        provider: str = "openai",
+        *,
+        model: str | None = None,
+    ) -> ProviderConfig:
+        """Config for the orchestrator — uses a more capable model tier by default."""
+        return cls._resolve(provider, model, _ORCHESTRATOR_DEFAULTS)

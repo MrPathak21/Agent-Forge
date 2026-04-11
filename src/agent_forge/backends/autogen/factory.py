@@ -27,13 +27,13 @@ class AutoGenFactory(AgentFactory):
         super().__init__()
         self._config: ProviderConfig = Settings.for_provider(provider, model=model)
 
-    def _build_model_client(self) -> OpenAIChatCompletionClient:
+    def _build_model_client(self, model_override: str | None = None) -> OpenAIChatCompletionClient:
         if self._config.provider != "openai":
             raise NotImplementedError(
                 f"AutoGenFactory only supports 'openai' today, got {self._config.provider!r}."
             )
         kwargs: dict[str, Any] = {
-            "model": self._config.model,
+            "model": model_override or self._config.model,
             "api_key": self._config.api_key,
         }
         if self._config.base_url:
@@ -47,6 +47,7 @@ class AutoGenFactory(AgentFactory):
         *,
         system_message: str,
         tools: list[str] | None = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> AutoGenAgent:
         from agent_forge.tools import get_tools
@@ -56,7 +57,7 @@ class AutoGenFactory(AgentFactory):
 
         native = AssistantAgent(
             name=name,
-            model_client=self._build_model_client(),
+            model_client=self._build_model_client(model_override=model),
             system_message=system_message,
             tools=resolved_tools,
         )

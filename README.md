@@ -397,6 +397,47 @@ All four guardrails have defensive JSON parse fallbacks — a single LLM hiccup 
 
 ---
 
+## Per-agent model selection
+
+The orchestrator can assign a different model to each agent or graph node based on the complexity of its role. This is automatic — no configuration needed.
+
+**Model tiers (OpenAI):**
+
+| Model | When used |
+|---|---|
+| `gpt-5.4-mini` | Default for all agents and the orchestrator |
+| `gpt-5.4-nano` | Simple, well-scoped tasks — extraction, formatting, summarization, classification |
+
+The orchestrator specifies the model in its plan JSON:
+
+```json
+{
+  "name": "action_extractor",
+  "role_description": "Extracts action items from the transcript",
+  "system_prompt": "...",
+  "task_prompt": "...",
+  "tools": [],
+  "model": "gpt-5.4-nano"
+}
+```
+
+`null` (or omitting the field) uses the provider default. Model guidance is provider-specific — the orchestrator only sees model names valid for the active provider.
+
+**Orchestrator model tier:**
+
+The orchestrator itself always uses a separate model config (`Settings.for_orchestrator()`), keeping it decoupled from agent model defaults. This ensures the orchestrator — which handles planning, convergence, synthesis, and all 4 guardrails — is never inadvertently downgraded when cheap agent models are assigned.
+
+---
+
+## Data-bearing goals
+
+When a goal contains raw data (e.g. a transcript, document, or dataset), agent-forge preserves the original payload throughout execution:
+
+- The **goal clarity guardrail** may rewrite a vague goal description for better planning — but the **original goal** (with full data) is always passed to agents during execution.
+- Both AutoGen debate agents and LangGraph nodes receive the original goal prepended to their task, ensuring they have access to the complete payload without needing to ask for it.
+
+---
+
 ## Adding a backend
 
 1. Copy the structure of `src/agent_forge/backends/autogen/`

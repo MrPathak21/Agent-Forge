@@ -28,6 +28,7 @@ class AgentSpec(BaseModel):
     role_description: str
     system_prompt: str
     tools: list[str] = []
+    model: str | None = None
 
 
 class GraphNode(BaseModel):
@@ -38,6 +39,7 @@ class GraphNode(BaseModel):
     system_prompt: str
     task_prompt: str
     tools: list[str] = []
+    model: str | None = None
 
 
 class GraphEdge(BaseModel):
@@ -120,7 +122,8 @@ For autogen:
       "name": "snake_case_name",
       "role_description": "one sentence",
       "system_prompt": "detailed, specific system prompt",
-      "tools": ["tool_name"]
+      "tools": ["tool_name"],
+      "model": null
     }}
   ]
 }}
@@ -138,7 +141,8 @@ For langgraph:
       "role_description": "one sentence",
       "system_prompt": "detailed persona, constraints, and domain knowledge for this node",
       "task_prompt": "the specific task this node must perform — tailored to its exact job, not the generic goal",
-      "tools": ["tool_name"]
+      "tools": ["tool_name"],
+      "model": null
     }}
   ],
   "edges": [
@@ -160,19 +164,45 @@ Rules:
   {{\\"route\\": \\"HIGH_RISK\\"}} if ... or {{\\"route\\": \\"LOW_RISK\\"}} if ..."
   The route value must exactly match the condition_key of the chosen edge (uppercase).
   Include one unconditional edge from the same node as the fallback.
+- CRITICAL: Agents are NOT interactive chatbots. Each agent receives all context in a \
+single message and must produce its complete output immediately — it cannot ask follow-up \
+questions or wait for more input. Write system_prompts and task_prompts that assume the \
+full goal and any data (transcript, documents, etc.) are already present in the message. \
+Never write prompts that say "please provide", "once you share", or "when given".
 - tools: choose ONLY from the available tools listed below. Empty list if none needed.
 - Only create agents/nodes that are genuinely necessary.
 - IMPORTANT: use the current date from the research context when writing system_prompt
   and task_prompt — never hardcode a specific year. Reference "latest", "current", or
   the actual date from context instead.
+- model: optionally assign a specific model to each agent/node based on the complexity \
+of its role. Use null to inherit the provider default. Only use model names from the \
+list below — do not use models from other providers.
+{models_guidance}
 
 Available tools:
 {tools_list}"""
 
+    _MODELS_GUIDANCE: dict[str, str] = {
+        "openai": (
+            '  - null (default "gpt-5.4-mini"): use for most agents — capable and well-rounded.\n'
+            '  - "gpt-5.4-nano": use for simple, well-scoped tasks: extraction, formatting, '
+            'summarization, classification where deep reasoning is not needed.'
+        ),
+        "anthropic": (
+            '  - "claude-opus-4-6": most capable — reserve for the most demanding reasoning.\n'
+            '  - null (default "claude-sonnet-4-6"): good balance — use for most agents.\n'
+            '  - "claude-haiku-4-5-20251001": cheapest — use for simple tasks.'
+        ),
+        "gemini": (
+            '  - null (default "gemini-2.5-flash"): use for all agents — only one tier available.'
+        ),
+    }
+
     def _build_system_prompt(self) -> str:
         from agent_forge.tools import list_tools
         tools_str = "\n".join(f"  - {t}" for t in list_tools())
-        return self._SYSTEM_BASE.format(tools_list=tools_str)
+        models_str = self._MODELS_GUIDANCE.get(self._config.provider, "  - null (use provider default)")
+        return self._SYSTEM_BASE.format(tools_list=tools_str, models_guidance=models_str)
 
     @staticmethod
     def _apply_strategy_overrides(data: dict, goal: str) -> dict:
@@ -206,7 +236,7 @@ Available tools:
         return data
 
     def __init__(self, provider: str = "openai", *, model: str | None = None) -> None:
-        self._config: ProviderConfig = Settings.for_provider(provider, model=model)
+        self._config: ProviderConfig = Settings.for_orchestrator(provider, model=model)
 
     def _client(self) -> AsyncOpenAI:
         """Create a fresh client per call so it binds to the current event loop."""

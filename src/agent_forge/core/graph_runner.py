@@ -133,6 +133,7 @@ class GraphRunner:
                 name=node.name,
                 system_message=node.system_prompt,
                 tools=node.tools or None,
+                model=node.model or None,
             )
             agents[node.name] = agent
 
@@ -147,7 +148,7 @@ class GraphRunner:
 
         def _make_node_fn(agent: Any, node_name: str, valid_routes: list[str]):
             async def node_fn(state: _AgentState) -> dict:
-                task = node_task_map[node_name]
+                task = f"{state['goal']}\n\n{node_task_map[node_name]}"
                 context = "\n\n".join(
                     f"{m['agent']}:\n{_strip_route(m['content'])}"
                     for m in state["messages"]
@@ -177,7 +178,7 @@ class GraphRunner:
         # ── No edges → parallel independent execution ─────────────────────────
         if not self._spec.edges:
             for node in self._spec.nodes:
-                content = await _run_with_retry(agents[node.name], node.task_prompt, node.name)
+                content = await _run_with_retry(agents[node.name], f"{goal}\n\n{node.task_prompt}", node.name)
                 clean = _strip_route(content)
                 self._messages.append({"agent": node.name, "content": clean})
                 yield ConversationMessage(agent=node.name, content=clean, round=1)
