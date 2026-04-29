@@ -454,3 +454,46 @@ The manager, orchestrator, conversation loop, graph runner, and API layer are al
 - Additional tools (code executor, news API, etc.)
 - Context compression for long agent conversations
 - Authentication / multi-user support
+
+---
+
+## Roadmap
+
+### Near-term
+
+**Model performance registry**
+Automated evaluation pipeline that scores models per task type on quality, accuracy, hallucination rate, cost, and latency — using a frontier model as judge. Results are stored in a SQL registry and surfaced to the orchestrator for intelligent model routing decisions at plan time.
+
+**Persistent orchestrator memory**
+Captures guardrail outcomes (plan validation scores, quality check results, grounding flags) and user feedback per run. Used to improve plan quality and agent system prompts over time — the orchestrator learns which planning patterns work well for which goal types.
+
+---
+
+### Medium-term
+
+**RAG-based prompt storage and categorisation**
+Stores prompts, agent outputs, and quality scores in a retrieval pipeline. The orchestrator can reference high-performing prompts from similar past goals when planning new runs, reducing trial-and-error in prompt generation.
+
+**Usage pattern analysis**
+Identifies high-frequency task categories from accumulated run data. Surfaces optimisation priorities — which task types run most often, cost the most, or produce the lowest quality scores — to guide infrastructure and fine-tuning decisions.
+
+**Multi-model routing**
+Assigns models to agent roles based on registry performance data rather than static defaults. Example: frontier model for synthesis and convergence judgment, mini for research and debate, nano for extraction and formatting — dynamically adjusted as registry data matures.
+
+---
+
+### Long-term vision
+
+**Fine-tuned SLMs for high-frequency task types**
+Uses accumulated usage data and categorised prompt/output pairs to train small, hyper-specific models. A fine-tuned SLM for a repeated task type (e.g. meeting MOM extraction, earnings report summarisation) can outperform general-purpose mini/nano models at a fraction of the cost.
+
+**Three-tier execution strategy**
+
+| Tier | Models | Latency | Cost | Best for |
+|---|---|---|---|---|
+| Real-time | Frontier | Instant | High | Complex reasoning, synthesis, judgment |
+| Near-time | Mini / Nano | Seconds | Low | Research, extraction, formatting |
+| Lazy | Fine-tuned SLMs | Minutes | Lowest | High-frequency, repeated task patterns |
+
+**Self-optimising orchestration**
+The system passively improves over time: usage data feeds back into prompt quality scoring, model selection refines via the performance registry, and accumulated outputs eventually seed custom model training. No manual intervention required — the orchestrator gets better the more it is used.
