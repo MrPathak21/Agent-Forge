@@ -31,9 +31,15 @@ dependencies = [
   "langgraph>=0.2.0",
   "langchain-openai>=0.1.0",
 
+  # App registry (YAML app configs)
+  "pyyaml>=6.0",
+
   # Anthropic backend (stub — uncomment when implementing)
   # "anthropic>=0.40.0",
 ]
+
+[project.scripts]
+agent-forge = "agent_forge.main:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

@@ -2,7 +2,14 @@
 
 **Framework-agnostic AI agent orchestration.**
 
-Send a goal, get back a synthesized report — produced by a dynamically planned team of AI agents that research, debate, and converge on an answer. No agents are predefined; the orchestrator writes every system prompt and task prompt from scratch for each goal.
+Send a goal, get back a synthesized report — produced by a dynamically planned team of AI agents that research, debate, and converge on an answer. No agents are predefined by default; the orchestrator writes every system prompt and task prompt from scratch for each goal.
+
+Two additive capabilities sit on top of that dynamic core:
+
+- **App Registry** — apps (e.g. [logscribe](../logscribe), [meeting-scribe](../meeting-scribe)) can register a fixed agent workflow in a config file. When a goal matches, agent-forge skips dynamic planning entirely (or partially) instead of inventing a team from scratch every time — cheaper, faster, and repeatable for the same kind of task.
+- **Traceability** — every run, whichever path it took, is persisted to a local SQLite database: which agents ran, what each one produced, tokens/cost/latency, which guardrails fired. Queryable via CLI, API, or the Streamlit UI's Traces tab.
+
+Zero registered apps and no queries against `/traces` is exactly today's behavior — both are fully additive.
 
 ---
 
@@ -12,7 +19,15 @@ Send a goal, get back a synthesized report — produced by a dynamically planned
 User goal
    │
    ▼
+[App Registry routing]        ← does the goal semantically match a registered app?
+   │                              locked  → skip straight to Execute, no LLM planning call
+   │                              unlocked→ fixed agents, framework/prompts still LLM-chosen
+   │                              none    → dynamic (current behavior, unchanged)
+   │                              emits app_routed (routing_tier, app_id)
+   │
+   ▼
 [Guardrail 1: Goal Clarity]   ← rewrites vague goals into specific, actionable ones
+   │                              (skippable per app config)
    │                              emits goal_clarified (was_changed + reasoning)
    │
    ▼
@@ -81,7 +96,10 @@ Orchestrator.synthesize       ← reads full execution output, writes final repo
 FastAPI (SSE stream)  ← every event streamed in real time
    │                    detail=result | orchestration | full
    ▼
-Streamlit UI          ← 4 tabs: Chat · Orchestrator · Agent Activity · Quality Guardrails
+Streamlit UI          ← 5 tabs: Chat · Orchestrator · Agent Activity · Quality Guardrails · Traces
+   │
+   ▼
+RunTracer → SQLite     ← every run persisted regardless of outcome (Traceability, below)
 ```
 
 ---
@@ -91,10 +109,10 @@ Streamlit UI          ← 4 tabs: Chat · Orchestrator · Agent Activity · Qual
 ```
 src/agent_forge/
 ├── core/
-│   ├── agent.py          # BaseAgent ABC + AgentStatus enum
+│   ├── agent.py          # BaseAgent ABC + AgentStatus enum + AgentRunResult
 │   ├── factory.py        # AgentFactory ABC (create / close)
-│   ├── manager.py        # AgentManager — lifecycle + task routing
-│   ├── orchestrator.py   # Orchestrator — plan, judge convergence, synthesize
+│   ├── manager.py        # AgentManager — lifecycle + task routing + trace recording
+│   ├── orchestrator.py   # Orchestrator — plan, judge convergence, synthesize, match/plan_from_app
 │   ├── conversation.py   # AgentConversation — multi-round AutoGen debate loop
 │   ├── graph_runner.py   # GraphRunner — LangGraph structured pipeline runner
 │   └── shared_thread.py  # SharedThread — sequential context passing
@@ -107,16 +125,21 @@ src/agent_forge/
 │   ├── web.py            # web_search (DuckDuckGo), fetch_url
 │   ├── finance.py        # stock_price, company_financials (yfinance)
 │   ├── utility.py        # get_datetime, calculator, wikipedia_search
-│   └── mcp_bridge.py     # MCPBridge — connects MCP servers, registers tools
+│   └── mcp_bridge.py     # MCPBridge — connects MCP servers, registers tools (with per-server tool allowlist)
+├── apps/                 # App Registry configs — one JSON/YAML file per registered app
 ├── api/
-│   └── app.py            # FastAPI backend — /health, /run, /run/stream
+│   └── app.py            # FastAPI backend — /health, /run, /run/stream, /apps, /traces
 ├── config/
 │   └── settings.py       # Provider config + env resolution
-└── main.py               # Minimal smoke-test entrypoint
+├── registry.py            # AppRegistry, AppConfig — loads apps/, builds locked-app plans (no LLM)
+├── tracing.py              # RunTracer — per-run trace accumulation, cost estimation
+├── db.py                   # SQLite persistence for traces (append-only)
+└── main.py                # CLI — `agent-forge run` (demo) / `agent-forge traces`
 
-app.py                    # Streamlit frontend — 4 tabs: Chat · Orchestrator · Agent Activity · Quality Guardrails
+app.py                    # Streamlit frontend — 5 tabs: Chat · Orchestrator · Agent Activity · Quality Guardrails · Traces
 mcp_servers.json          # MCP server config (gitignored, create from example)
 mcp_servers.example.json  # Example MCP server config
+agent_forge_traces.db     # SQLite trace store (gitignored, zero-config default path)
 ```
 
 ---
@@ -145,6 +168,14 @@ uvicorn agent_forge.api.app:app --reload --port 8000
 
 ```bash
 streamlit run app.py
+```
+
+**CLI** (`pip install -e .` registers the `agent-forge` console script):
+
+```bash
+agent-forge run                          # hardcoded demo goal, autogen only
+agent-forge traces --last 10             # query run history
+agent-forge traces --app logscribe --status failed
 ```
 
 ---
@@ -203,6 +234,70 @@ data: {"type": "error", "message": "..."}
 
 ---
 
+## App Registry
+
+Apps can register a fixed agent workflow instead of relying on dynamic planning every time — useful when the same kind of task recurs (log root-cause analysis, meeting minutes, etc.) and inventing a new team per request is unnecessary cost/latency.
+
+Drop a config file in `src/agent_forge/apps/`:
+
+```json
+{
+  "app_id": "logscribe",
+  "name": "LogScribe — Production Error Root-Cause Analysis",
+  "triggers": ["log error analysis", "root cause analysis of a production error"],
+  "description": "...",
+  "workflow": [
+    {
+      "agent": "root_cause_analyst",
+      "role": "You are a senior SRE performing root-cause analysis...",
+      "tools": ["mcp_repo_git_log", "mcp_repo_git_show"]
+    }
+  ],
+  "framework": "langgraph",
+  "framework_locked": true,
+  "models": {"root_cause_analyst": "gpt-5.4-mini"},
+  "guardrails": {"skip_goal_clarity": true, "skip_plan_validation": true, "hallucination_check": true}
+}
+```
+
+No code changes needed — restart the backend (or call the registry's `register()` programmatically) and it's live.
+
+### Routing tiers
+
+| Tier | Condition | Behavior |
+|---|---|---|
+| **Locked** | matched app, `framework_locked: true` | Plan built deterministically from the config — zero LLM planning calls. Agent system prompts come from a fixed template, not orchestrator-written prose. |
+| **Unlocked** | matched app, `framework_locked: false` | Agent names/roles are fixed by the config; one LLM call still picks the framework (autogen/langgraph) and writes prompts. |
+| **Dynamic** | no app matches | Today's behavior, byte-for-byte unchanged. |
+
+Matching is semantic (an LLM call comparing the goal against each registered app's `triggers`/`description`), not keyword-based — and is skipped entirely when zero apps are registered, so an unmodified install pays no extra cost or latency.
+
+Per-app `guardrails` flags (`skip_goal_clarity`, `skip_plan_validation`, `hallucination_check`) let each app opt in/out of the standard guardrail pipeline — e.g. skip goal clarity for an app whose goal is always already fully-specified, but keep grounding checks on for anything where a fabricated claim matters (root-cause analysis, meeting minutes).
+
+---
+
+## Traceability
+
+Every run — locked, unlocked, or dynamic, successful or failed — is persisted to a local SQLite database (`agent_forge_traces.db`, zero config, path overridable via `AGENT_FORGE_DB_PATH`). Traces are append-only.
+
+Each trace records: routing tier + matched app, framework used, every spawned agent (model, tokens, latency, status, **and its full output**), which guardrails actually fired, the final synthesized report, total cost/latency/tokens, and outcome/error.
+
+Query via CLI, API, or the Streamlit UI's **Traces** tab (filter by app/status/cost, drill into any run to see the goal, the final report, and each agent's full output):
+
+```bash
+agent-forge traces --last 10
+agent-forge traces --app logscribe --status failed
+```
+
+```
+GET /traces?limit=10&app_id=logscribe&status=failed&cost_above=0.01
+GET /traces/{run_id}
+```
+
+**Scope note:** v1 tokenizes spawned-agent calls only — the orchestrator's own planning/guardrail LLM calls aren't yet counted, so `total_cost_usd`/`total_tokens` understate true spend for dynamic (non-locked) runs. A known, disclosed gap, not silently rounded into the totals.
+
+---
+
 ## MCP servers
 
 agent-forge supports [Model Context Protocol](https://modelcontextprotocol.io) servers as a first-class tool source. Any MCP server's tools are automatically discovered at startup, registered in the tool registry, and made available for the orchestrator to assign to agents — no code changes needed.
@@ -225,13 +320,21 @@ cp mcp_servers.example.json mcp_servers.json
     "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/data"]
   },
   {
+    "name": "repo",
+    "command": "uvx",
+    "args": ["mcp-server-git", "--repository", "/path/to/monitored/repo"],
+    "tools": ["git_log", "git_show", "git_diff", "git_status"]
+  },
+  {
     "name": "myserver",
     "url": "http://localhost:3000/sse"
   }
 ]
 ```
 
-Each server's tools are registered as `mcp_{name}_{tool_name}` (e.g. `mcp_filesystem_read_file`). The orchestrator sees them in its available tools list and assigns them to agents that need them.
+Each server's tools are registered as `mcp_{name}_{tool_name}` (e.g. `mcp_filesystem_read_file`, `mcp_repo_git_log`). The orchestrator sees them in its available tools list and assigns them to agents that need them; a registered app's config can also name them explicitly in a workflow step's `tools` list (see App Registry, above).
+
+**`tools` allowlist (optional, recommended for anything with write capability):** without it, *every* tool a server advertises gets registered — including mutating ones like a git server's `git_commit`/`git_checkout` or a filesystem server's `write_file`/`edit_file`. Set `tools` to the exact subset you want available; anything else the server offers is never even registered, for any agent, locked or dynamic. The `repo` example above only exposes read-only git operations.
 
 ### Adding a new server
 
@@ -454,6 +557,9 @@ The manager, orchestrator, conversation loop, graph runner, and API layer are al
 - Additional tools (code executor, news API, etc.)
 - Context compression for long agent conversations
 - Authentication / multi-user support
+- Tokenize the orchestrator's own planning/guardrail calls into trace totals (currently only spawned agents are counted)
+- Dashboard/UI for aggregate trace analytics (currently per-run only)
+- Auto-promotion between App Registry tiers (locked ↔ unlocked) based on trace data
 
 ---
 
@@ -462,10 +568,10 @@ The manager, orchestrator, conversation loop, graph runner, and API layer are al
 ### Near-term
 
 **Model performance registry**
-Automated evaluation pipeline that scores models per task type on quality, accuracy, hallucination rate, cost, and latency — using a frontier model as judge. Results are stored in a SQL registry and surfaced to the orchestrator for intelligent model routing decisions at plan time.
+Automated evaluation pipeline that scores models per task type on quality, accuracy, hallucination rate, cost, and latency — using a frontier model as judge. Results are stored in a SQL registry and surfaced to the orchestrator for intelligent model routing decisions at plan time. *Traceability (shipped) provides the raw data layer this would build on — per-run cost/latency/tokens/guardrail outcomes are already captured; this item is the analysis/scoring layer on top.*
 
 **Persistent orchestrator memory**
-Captures guardrail outcomes (plan validation scores, quality check results, grounding flags) and user feedback per run. Used to improve plan quality and agent system prompts over time — the orchestrator learns which planning patterns work well for which goal types.
+Captures guardrail outcomes (plan validation scores, quality check results, grounding flags) and user feedback per run. Used to improve plan quality and agent system prompts over time — the orchestrator learns which planning patterns work well for which goal types. *`guardrails_triggered` per run is already in the trace store; this item is about feeding it back into planning, not just recording it.*
 
 ---
 

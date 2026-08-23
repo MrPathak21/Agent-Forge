@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
-from agent_forge.core.agent import BaseAgent
+from agent_forge.core.agent import AgentRunResult, BaseAgent
 from agent_forge.core.factory import AgentFactory
 
 if TYPE_CHECKING:
     from agent_forge.core.shared_thread import SharedThread
+    from agent_forge.tracing import RunTracer
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +28,9 @@ class AgentManager:
         await manager.shutdown()
     """
 
-    def __init__(self, factory: AgentFactory) -> None:
+    def __init__(self, factory: AgentFactory, tracer: RunTracer | None = None) -> None:
         self._factory = factory
+        self._tracer = tracer
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -79,12 +82,25 @@ class AgentManager:
         if thread and not thread.is_empty():
             full_task = f"{task}\n\n{thread.to_context()}"
 
-        result = await agent.run(full_task, **kwargs)
+        start = time.perf_counter()
+        try:
+            result = await agent.run(full_task, **kwargs)
+        except Exception:
+            if self._tracer is not None:
+                latency_ms = (time.perf_counter() - start) * 1000
+                self._tracer.record_agent(
+                    agent.name, AgentRunResult(content="", model=""), latency_ms, status="failed"
+                )
+            raise
+
+        if self._tracer is not None:
+            latency_ms = (time.perf_counter() - start) * 1000
+            self._tracer.record_agent(agent.name, result, latency_ms, status="success")
 
         if thread is not None:
-            thread.add(agent.name, result)
+            thread.add(agent.name, result.content)
 
-        return result
+        return result.content
 
     # ------------------------------------------------------------------
     # Introspection

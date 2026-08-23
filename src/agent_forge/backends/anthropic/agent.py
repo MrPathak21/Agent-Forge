@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_forge.core.agent import AgentStatus, BaseAgent
+from agent_forge.core.agent import AgentRunResult, AgentStatus, BaseAgent
 
 
 class AnthropicAgent(BaseAgent):
@@ -33,7 +33,7 @@ class AnthropicAgent(BaseAgent):
         self._system_message = system_message
         # self._client = <anthropic.AsyncAnthropic goes here>
 
-    async def run(self, task: str, **kwargs: Any) -> str:
+    async def run(self, task: str, **kwargs: Any) -> AgentRunResult:
         raise NotImplementedError(
             "AnthropicAgent.run() is not implemented yet. "
             "Call client.messages.create() with the task as a user message."

@@ -452,7 +452,12 @@ Available tools:
         "You are a senior analyst synthesizing the findings from multiple AI agents. "
         "Given the original goal and the full agent conversation, produce a single, clean, "
         "well-structured final response for the user. Eliminate redundancy, resolve any "
-        "contradictions, and present the most important insights clearly and concisely."
+        "contradictions, and present the most important insights clearly and concisely.\n\n"
+        "CRITICAL: preserve concrete, verifiable specifics from the conversation — exact "
+        "identifiers (commit hashes, IDs, file paths, line numbers, tool names), numbers, "
+        "names, and dates. These are load-bearing evidence, not filler — condensing prose "
+        "is fine, but never generalize away a specific fact an agent already found in favor "
+        "of vaguer phrasing."
     )
 
     _CONVERGENCE_SYSTEM = (
@@ -570,6 +575,163 @@ Available tools:
             return data["converged"], data["reason"]
         except Exception:
             return await self._should_stop_simple(goal, history_text)
+
+    # ── App registry ──────────────────────────────────────────────────────────
+
+    _APP_MATCH_SYSTEM = (
+        "You are an app-routing classifier for an AI agent orchestration system. "
+        "Given a user's goal and a list of registered apps (each with triggers and a "
+        "description), decide whether the goal semantically matches ONE of the apps "
+        "closely enough that the app's pre-built workflow should handle it directly, "
+        "instead of dynamically planning a new agent team.\n\n"
+        "Match on MEANING, not just shared keywords — e.g. a goal about 'why is my "
+        "service throwing 500s' should match an app whose trigger is 'error "
+        "investigation' even with no literal word overlap. Only match when you are "
+        "genuinely confident the app's workflow is what the goal calls for; when in "
+        "doubt, return no match so the goal falls through to dynamic planning.\n\n"
+        "Return JSON: {\"app_id\": \"<id of best match, or null if none fit>\", "
+        "\"confidence\": <0.0-1.0>, \"reasoning\": \"one sentence\"}"
+    )
+
+    async def match_app(self, goal: str, apps: list[Any]) -> dict:
+        """
+        Semantically match a goal against registered apps (AppConfig instances).
+        Returns {"app_id": str|None, "confidence": float, "reasoning": str}.
+        Falls back to no match on any error — a failed match always falls
+        through to dynamic planning, never blocks the pipeline.
+        """
+        if not apps:
+            return {"app_id": None, "confidence": 0.0, "reasoning": "No apps registered."}
+
+        apps_desc = "\n\n".join(
+            f"- app_id: {a.app_id}\n  name: {a.name}\n  triggers: {a.triggers}\n  description: {a.description}"
+            for a in apps
+        )
+        try:
+            response = await self._client().chat.completions.create(
+                model=self._config.model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": self._APP_MATCH_SYSTEM},
+                    {"role": "user", "content": f"Goal: {goal}\n\nRegistered apps:\n{apps_desc}"},
+                ],
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception:
+            return {"app_id": None, "confidence": 0.0, "reasoning": "App match failed — falling back to dynamic."}
+
+    _APP_CONSTRAINED_PLAN_SYSTEM = """\
+You are an agent orchestration planner. A specific app has already defined which \
+agents/nodes to use and their high-level roles — you must NOT invent, rename, remove, \
+or add agents. Your only job is to:
+1. Pick the best execution strategy: "autogen" (agents debate/discuss) or "langgraph" \
+(structured pipeline). The app's suggested strategy is given below — override it only \
+if clearly wrong for this specific goal.
+2. Write a detailed system_prompt for each named agent/node.
+3. For langgraph only: write a task_prompt per node, and edges connecting them \
+(sequential unless a clear conditional need is described in a role).
+
+The agent/node list must contain EXACTLY the agents given below, in the same order, \
+using their exact given names — nothing added, removed, or renamed.
+
+Fixed agents for this app:
+{fixed_agents}
+
+Suggested strategy (from the app config): {suggested_strategy}
+
+RETURN a JSON object — choose exactly one of these formats (every field shown is \
+required, including "role_description" on every agent/node):
+
+For autogen:
+{{
+  "strategy": "autogen",
+  "agents": [
+    {{
+      "name": "<exact fixed agent name>",
+      "role_description": "one sentence",
+      "system_prompt": "detailed, specific system prompt",
+      "tools": [],
+      "model": null
+    }}
+  ]
+}}
+
+For langgraph:
+{{
+  "strategy": "langgraph",
+  "nodes": [
+    {{
+      "name": "<exact fixed agent name>",
+      "role_description": "one sentence",
+      "system_prompt": "detailed persona, constraints, and domain knowledge for this node",
+      "task_prompt": "the specific task this node must perform",
+      "tools": [],
+      "model": null
+    }}
+  ],
+  "edges": [
+    {{"from": "<node_a>", "to": "<node_b>"}}
+  ],
+  "entry": "<first node name>"
+}}
+
+Rules:
+- tools: always an empty list — this app does not use tools.
+- model: use null to inherit the provider default.
+- For langgraph: chain the fixed agents sequentially via edges (node 1 → node 2 → ...) \
+unless a role clearly calls for conditional routing.
+"""
+
+    async def plan_from_app(
+        self, app: Any, goal: str, research_text: str = ""
+    ) -> tuple[GraphSpec | list[AgentSpec], str]:
+        """
+        Build an execution plan for a matched app (AppConfig).
+
+        - framework_locked: deterministic, template-based, no LLM call at all.
+        - not locked: one constrained LLM call — agent names/roles are fixed by
+          the app; the LLM only picks the framework and writes prompts.
+
+        Returns (plan, framework_used).
+        """
+        from agent_forge.registry import build_plan_from_app
+
+        if app.framework_locked:
+            return build_plan_from_app(app)
+
+        fixed_agents = "\n".join(f"- {s.agent}: {s.role}" for s in app.workflow)
+        user_content = f"Goal: {goal}"
+        if research_text:
+            user_content += f"\n\nCurrent context from research:\n{research_text}"
+
+        try:
+            response = await self._client().chat.completions.create(
+                model=self._config.model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": self._APP_CONSTRAINED_PLAN_SYSTEM.format(
+                            fixed_agents=fixed_agents, suggested_strategy=app.framework,
+                        ),
+                    },
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            data = json.loads(response.choices[0].message.content)
+        except Exception:
+            # Safe fallback: behave like a locked app if the constrained call fails.
+            return build_plan_from_app(app)
+
+        if data.get("strategy") == "langgraph":
+            plan: GraphSpec | list[AgentSpec] = GraphSpec(
+                nodes=[GraphNode(**n) for n in data["nodes"]],
+                edges=[GraphEdge.model_validate(e) for e in data["edges"]],
+                entry=data["entry"],
+            )
+            return plan, "langgraph"
+        plan = [AgentSpec(**s) for s in data.get("agents", [])]
+        return plan, "autogen"
 
     # ── Quality guardrails ────────────────────────────────────────────────────
 

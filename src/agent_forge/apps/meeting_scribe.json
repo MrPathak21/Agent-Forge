@@ -1,0 +1,34 @@
+{
+  "app_id": "meeting_scribe",
+  "name": "Meeting Scribe — Minutes of Meeting Generator",
+  "version": "1.0",
+  "triggers": [
+    "meeting transcript summarization",
+    "minutes of meeting (MOM) generation",
+    "extract decisions and action items from a meeting transcript",
+    "meeting notes and next steps"
+  ],
+  "description": "Turns a raw meeting transcript into a structured Minutes of Meeting document — executive summary, key decisions, action items with owners/deadlines/priority, and next steps. Matches requests that embed a meeting title/date/attendees header plus a full transcript and ask for a professional MOM document with those sections.",
+  "workflow": [
+    {
+      "agent": "fact_extractor",
+      "role": "Read the full meeting transcript and pull out only what was explicitly said: decisions made, action items (task, owner, deadline, priority — mark as TBD/unstated if not given), and any follow-ups or next steps mentioned. Do not infer or invent anything not grounded in the transcript."
+    },
+    {
+      "agent": "mom_writer",
+      "role": "Take the extracted facts and the original request (including meeting title, date, attendees, and the required section format) and write the final polished Minutes of Meeting document with an Executive Summary, Key Decisions, Action Items, and Next Steps — following the exact section structure requested."
+    }
+  ],
+  "framework": "langgraph",
+  "framework_locked": true,
+  "models": {
+    "fact_extractor": "gpt-5.4-nano",
+    "mom_writer": "gpt-5.4-mini"
+  },
+  "models_locked": false,
+  "guardrails": {
+    "skip_goal_clarity": true,
+    "skip_plan_validation": true,
+    "hallucination_check": true
+  }
+}

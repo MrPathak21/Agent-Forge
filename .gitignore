@@ -34,3 +34,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local run-trace database (SQLite, zero-config default)
+agent_forge_traces.db

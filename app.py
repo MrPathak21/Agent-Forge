@@ -42,6 +42,28 @@ def fetch_tools() -> list[str]:
         return []
 
 
+def fetch_traces(
+    *, limit: int = 20, app_id: str | None = None, status: str | None = None,
+    since: str | None = None, cost_above: float | None = None,
+) -> list[dict]:
+    params: dict = {"limit": limit}
+    if app_id:
+        params["app_id"] = app_id
+    if status:
+        params["status"] = status
+    if since:
+        params["since"] = since
+    if cost_above is not None:
+        params["cost_above"] = cost_above
+    try:
+        resp = httpx.get(f"{API_URL}/traces", params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        st.error(f"Failed to fetch traces: {exc}")
+        return []
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _AGENT_COLORS = ["#4F8EF7", "#F7874F", "#4FD18C", "#F7CF4F", "#C44FF7", "#F74F6E"]
@@ -87,7 +109,9 @@ st.title("🔨 agent-forge")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_chat, tab_orch, tab_agents, tab_quality = st.tabs(["💬 Chat", "🧠 Orchestrator", "🤖 Agent Activity", "🛡️ Quality Guardrails"])
+tab_chat, tab_orch, tab_agents, tab_quality, tab_traces = st.tabs(
+    ["💬 Chat", "🧠 Orchestrator", "🤖 Agent Activity", "🛡️ Quality Guardrails", "📈 Traces"]
+)
 
 # ── Tab 1: Chat ───────────────────────────────────────────────────────────────
 
@@ -102,6 +126,7 @@ with tab_chat:
         run_btn = st.button("▶ Run", type="primary", disabled=not goal.strip())
     with col_rounds:
         max_rounds = st.number_input("Max rounds", min_value=1, max_value=10, value=3)
+    routing_badge = st.empty()
     st.divider()
     chat_status = st.empty()
     final_report = st.empty()
@@ -109,6 +134,7 @@ with tab_chat:
 # ── Tab 2: Orchestrator ───────────────────────────────────────────────────────
 
 with tab_orch:
+    routing_display = st.empty()
     orch_status = st.empty()
     orch_raw = st.empty()
     orch_details = st.container()
@@ -133,6 +159,92 @@ with tab_quality:
     st.markdown("#### 🔍 Grounding Check")
     grounding_check_display = st.empty()
 
+# ── Tab 5: Traces ─────────────────────────────────────────────────────────────
+# Independent of the Chat tab's run — reads persisted history from GET /traces.
+
+with tab_traces:
+    st.markdown("#### 📈 Run History")
+    col_a, col_b, col_c, col_d, col_e = st.columns([2, 2, 1, 2, 1])
+    with col_a:
+        trace_app_filter = st.text_input("App ID", value="", key="trace_app_filter")
+    with col_b:
+        trace_status_filter = st.selectbox(
+            "Status", ["", "success", "partial", "failed"], key="trace_status_filter"
+        )
+    with col_c:
+        trace_limit = st.number_input("Limit", min_value=1, max_value=200, value=20, key="trace_limit")
+    with col_d:
+        trace_cost_above_raw = st.text_input("Cost above ($)", value="", key="trace_cost_above")
+    with col_e:
+        st.write("")
+        st.button("🔄 Refresh", key="refresh_traces")
+
+    try:
+        trace_cost_above = float(trace_cost_above_raw) if trace_cost_above_raw.strip() else None
+    except ValueError:
+        st.warning("Cost above must be a number — ignoring filter.")
+        trace_cost_above = None
+
+    traces = fetch_traces(
+        limit=int(trace_limit),
+        app_id=trace_app_filter or None,
+        status=trace_status_filter or None,
+        cost_above=trace_cost_above,
+    )
+
+    if not traces:
+        st.info("No traces yet — run a goal from the Chat tab, or adjust filters.")
+    else:
+        st.dataframe(
+            [
+                {
+                    "run_id": t["run_id"][:8],
+                    "timestamp": t["timestamp"][:19],
+                    "tier": t["routing_tier"],
+                    "app_id": t.get("app_id") or "-",
+                    "framework": t.get("framework_used") or "-",
+                    "outcome": t["outcome"],
+                    "latency_ms": t["total_latency_ms"],
+                    "cost_usd": t["total_cost_usd"],
+                    "tokens_in": t["total_input_tokens"],
+                    "tokens_out": t["total_output_tokens"],
+                }
+                for t in traces
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("##### Run detail")
+        run_options = {f"{t['run_id'][:8]} — {t['timestamp'][:19]} ({t['outcome']})": t for t in traces}
+        selected_label = st.selectbox("Select a run to inspect", list(run_options.keys()), key="trace_detail_select")
+        if selected_label:
+            detail = run_options[selected_label]
+            with st.expander("Task / goal sent to agent-forge"):
+                st.text(detail["task"])
+            if detail.get("error"):
+                st.error(detail["error"])
+            if detail["guardrails_triggered"]:
+                st.warning(f"Guardrails triggered: {', '.join(detail['guardrails_triggered'])}")
+
+            if detail.get("report"):
+                st.markdown("**Final report**")
+                st.markdown(detail["report"])
+                st.divider()
+
+            if detail["agents_spawned"]:
+                st.markdown("**Agents spawned**")
+                st.dataframe(
+                    [{k: v for k, v in a.items() if k != "content"} for a in detail["agents_spawned"]],
+                    use_container_width=True, hide_index=True,
+                )
+                st.markdown("**Agent output**")
+                for a in detail["agents_spawned"]:
+                    with st.expander(f"`{a['agent_id']}` — {a['model']} ({a['status']})"):
+                        st.markdown(a.get("content") or "_(no content recorded)_")
+            else:
+                st.caption("No agent-level data recorded for this run.")
+
 if not run_btn:
     st.stop()
 
@@ -155,7 +267,28 @@ quality_checks: list[dict] = []
 for event in stream_run(goal, int(max_rounds)):
     etype = event.get("type")
 
-    if etype == "goal_clarified":
+    if etype == "app_routed":
+        tier = event["routing_tier"]
+        matched_app = event.get("app_id")
+        if tier == "dynamic":
+            badge = "🧭 **dynamic** — no registered app matched, planning from scratch"
+            detail = "No registered app matched this goal — falling through to dynamic orchestration."
+            chat_status.info("⏳ Researching goal...")
+        else:
+            icon = "🔒" if tier == "locked" else "🔓"
+            badge = f"{icon} **{tier}** — routed to app `{matched_app}`"
+            detail = (
+                f"Matched registered app `{matched_app}` — "
+                + ("workflow and framework are fixed, dynamic planning skipped."
+                   if tier == "locked" else
+                   "workflow is fixed, framework chosen per run.")
+            )
+            chat_status.info(f"⏳ Using app `{matched_app}` ({tier})...")
+        routing_badge.markdown(badge)
+        with routing_display:
+            (st.success if tier != "dynamic" else st.info)(detail)
+
+    elif etype == "goal_clarified":
         was_changed = event.get("was_changed", False)
         with goal_clarity_display:
             if was_changed:

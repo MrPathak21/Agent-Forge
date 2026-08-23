@@ -16,23 +16,41 @@ Endpoints:
 
 import json
 import logging
+from contextlib import asynccontextmanager
 from enum import Enum
+from pathlib import Path
 from typing import AsyncGenerator
 
 log = logging.getLogger("uvicorn.error")
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from agent_forge import db
 from agent_forge.backends.autogen import AutoGenFactory
 from agent_forge.backends.langgraph import LangGraphFactory
 from agent_forge.core.conversation import AgentConversation, ConversationMessage, StopSignal
 from agent_forge.core.graph_runner import GraphRunner
 from agent_forge.core.manager import AgentManager
 from agent_forge.core.orchestrator import AgentSpec, GraphSpec, Orchestrator
+from agent_forge.registry import AppRegistry
 from agent_forge.tools.mcp_bridge import MCPBridge
+from agent_forge.tracing import RunTracer
+
+# ── App registry ─────────────────────────────────────────────────────────────
+
+app_registry = AppRegistry()
+_APPS_DIR = Path(__file__).resolve().parent.parent / "apps"
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    app_registry.load(_APPS_DIR)
+    log.info("Loaded %d registered app(s) from %s", len(app_registry.list_apps()), _APPS_DIR)
+    yield
+
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -44,6 +62,7 @@ app = FastAPI(
         "Send a goal, get back a synthesized report produced by a dynamically planned "
         "team of AI agents that research, debate, and converge on an answer."
     ),
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -101,200 +120,281 @@ async def _pipeline_inner(req: RunRequest) -> AsyncGenerator[tuple[str, str], No
     """Core pipeline logic, called inside an active MCPBridge context.
 
     Pipeline stages:
-    1. Goal Clarity Pre-check  — rewrite vague goals before anything else
-    2. Research                — tool calls run ONCE (not repeated on plan retries)
-    3. Plan + Validate loop    — up to 3 attempts; validator rejects bad plans
+    0. App Registry routing    — short-circuit dynamic planning for a matched app
+    1. Goal Clarity Pre-check  — rewrite vague goals before anything else (skippable per app)
+    2. Research                — tool calls run ONCE (not repeated on plan retries; skipped for app-routed runs)
+    3. Plan + Validate loop    — up to 3 attempts for dynamic; single-shot (+ optional validation) for app-routed
     4. Execute                 — autogen debate or langgraph pipeline
     5. Synthesize + Quality loop — up to 1 retry with feedback
-    6. Grounding Check         — verify synthesis claims are backed by agent output
+    6. Grounding Check         — verify synthesis claims are backed by agent output (skippable per app)
+
+    Every run is traced end-to-end via RunTracer and persisted to SQLite on completion.
     """
     log.info("Pipeline started | goal=%r | provider=%s", req.goal[:80], req.provider)
     orchestrator = Orchestrator(provider=req.provider)
 
-    # ── Guardrail 1: Goal Clarity ─────────────────────────────────────────────
-    # NOTE: effective_goal is used for planning/orchestration only.
-    # The original req.goal (which may carry raw data like transcripts) is
-    # passed to agent execution so agents always have access to the full payload.
-    log.info("[guardrail:goal_clarity] checking goal specificity")
-    clarity = await orchestrator.clarify_goal(req.goal)
-    effective_goal = clarity["clarified_goal"]
-    log.info("[guardrail:goal_clarity] was_changed=%s reasoning=%r",
-             clarity["was_changed"], clarity.get("reasoning", ""))
-    yield "goal_clarified", json.dumps({
-        "original": req.goal,
-        "clarified": effective_goal,
-        "reasoning": clarity.get("reasoning", ""),
-        "was_changed": clarity["was_changed"],
+    # ── Stage 0: App Registry routing ─────────────────────────────────────────
+    registered_apps = app_registry.list_apps()
+    if registered_apps:
+        match = await orchestrator.match_app(req.goal, registered_apps)
+    else:
+        match = {"app_id": None, "confidence": 0.0, "reasoning": "No apps registered."}
+
+    app_config = None
+    if match.get("app_id") and match.get("confidence", 0.0) >= 0.65:
+        app_config = app_registry.get(match["app_id"])
+
+    routing_tier = "dynamic"
+    if app_config is not None:
+        routing_tier = "locked" if app_config.framework_locked else "unlocked"
+
+    log.info("[app_registry] routing_tier=%s app_id=%s", routing_tier,
+             app_config.app_id if app_config else None)
+    yield "app_routed", json.dumps({
+        "routing_tier": routing_tier,
+        "app_id": app_config.app_id if app_config else None,
     })
 
-    # ── Research (runs ONCE before the plan retry loop) ───────────────────────
-    log.info("[research] starting")
-    tool_calls, research_text = await orchestrator._research(effective_goal)
-    for tc in tool_calls:
-        log.info("[research] tool_call=%s args=%s", tc.tool, tc.args)
-        yield "orchestrator_tool_call", json.dumps({
-            "tool": tc.tool, "args": tc.args, "result": tc.result,
-        })
+    tracer = RunTracer(
+        task=req.goal, routing_tier=routing_tier,
+        app_id=app_config.app_id if app_config else None,
+    )
 
-    # ── Guardrail 2: Plan + Validate loop (max 3 attempts) ───────────────────
-    plan: list[AgentSpec] | GraphSpec | None = None
-    plan_feedback: str | None = None
-    MAX_PLAN_RETRIES = 3
+    try:
+        # ── Guardrail 1: Goal Clarity ─────────────────────────────────────────
+        # NOTE: effective_goal is used for planning/orchestration only.
+        # The original req.goal (which may carry raw data like transcripts) is
+        # passed to agent execution so agents always have access to the full payload.
+        if app_config is not None and app_config.guardrails.skip_goal_clarity:
+            effective_goal = req.goal
+            log.info("[guardrail:goal_clarity] skipped by app config app_id=%s", app_config.app_id)
+        else:
+            log.info("[guardrail:goal_clarity] checking goal specificity")
+            clarity = await orchestrator.clarify_goal(req.goal)
+            effective_goal = clarity["clarified_goal"]
+            log.info("[guardrail:goal_clarity] was_changed=%s reasoning=%r",
+                     clarity["was_changed"], clarity.get("reasoning", ""))
+            yield "goal_clarified", json.dumps({
+                "original": req.goal,
+                "clarified": effective_goal,
+                "reasoning": clarity.get("reasoning", ""),
+                "was_changed": clarity["was_changed"],
+            })
 
-    for plan_attempt in range(1, MAX_PLAN_RETRIES + 1):
-        log.info("[plan] attempt=%d", plan_attempt)
-        plan_chunks: list[str] = []
-
-        async for item in orchestrator._generate_plan_stream(
-            effective_goal, research_text, feedback=plan_feedback
-        ):
-            if isinstance(item, GraphSpec):
-                plan = item
-                node_names = [n.name for n in item.nodes]
-                edges = [(e.from_node, e.to_node) for e in item.edges]
-                log.info("[plan] strategy=langgraph nodes=%s edges=%s entry=%s",
-                         node_names, edges, item.entry)
-                yield "plan_ready", json.dumps({
-                    "strategy": "langgraph",
-                    "spec": item.model_dump(by_alias=True),
+        # ── Research (runs ONCE before the plan retry loop; skipped for app-routed runs) ──
+        research_text = ""
+        if app_config is None:
+            log.info("[research] starting")
+            tool_calls, research_text = await orchestrator._research(effective_goal)
+            for tc in tool_calls:
+                log.info("[research] tool_call=%s args=%s", tc.tool, tc.args)
+                yield "orchestrator_tool_call", json.dumps({
+                    "tool": tc.tool, "args": tc.args, "result": tc.result,
                 })
-            elif isinstance(item, list):
-                plan = item
-                log.info("[plan] strategy=autogen agents=%s", [s.name for s in item])
+
+        # ── Guardrail 2: Plan + Validate ───────────────────────────────────────
+        plan: list[AgentSpec] | GraphSpec | None = None
+
+        if app_config is not None:
+            plan, _ = await orchestrator.plan_from_app(app_config, effective_goal, research_text)
+            if isinstance(plan, GraphSpec):
                 yield "plan_ready", json.dumps({
-                    "strategy": "autogen",
-                    "specs": [s.model_dump() for s in item],
+                    "strategy": "langgraph", "spec": plan.model_dump(by_alias=True),
                 })
             else:
-                plan_chunks.append(item)
-                yield "plan_chunk", json.dumps({"text": item})
-
-        validation = await orchestrator.validate_plan(effective_goal, "".join(plan_chunks))
-        log.info("[guardrail:plan_validator] attempt=%d valid=%s feedback=%r",
-                 plan_attempt, validation["valid"], validation.get("feedback", ""))
-        yield "plan_validation", json.dumps({
-            "valid": validation["valid"],
-            "feedback": validation.get("feedback", ""),
-            "attempt": plan_attempt,
-        })
-
-        if validation["valid"]:
-            break
-
-        plan_feedback = validation["feedback"]
-        if plan_attempt == MAX_PLAN_RETRIES:
-            log.warning("[guardrail:plan_validator] max retries reached — proceeding with last plan")
-
-    # ── Execute — AutoGen debate or LangGraph pipeline ────────────────────────
-    context_source: AgentConversation | GraphRunner
-
-    if isinstance(plan, GraphSpec):
-        log.info("[execute] strategy=langgraph")
-        factory = LangGraphFactory(provider=req.provider)
-        runner = GraphRunner(factory=factory, spec=plan)
-        async for item in runner.run_stream(req.goal):
-            if isinstance(item, ConversationMessage):
-                log.info("[node] %s | %d chars", item.agent, len(item.content))
-                yield "agent_message", json.dumps({
-                    "agent": item.agent, "content": item.content, "round": item.round,
+                yield "plan_ready", json.dumps({
+                    "strategy": "autogen", "specs": [s.model_dump() for s in plan],
                 })
-            elif isinstance(item, StopSignal):
-                log.info("[stop] %s (by=%s)", item.reason, item.stopped_by)
-                yield "stop_signal", json.dumps({
-                    "reason": item.reason, "stopped_by": item.stopped_by,
-                })
-        context_source = runner
 
-    else:
-        log.info("[execute] strategy=autogen")
-        specs: list[AgentSpec] = plan or []
-        factory = AutoGenFactory(provider=req.provider)
-        manager = AgentManager(factory)
-        agents = []
-        for spec in specs:
-            agent = await manager.spawn(
-                role=spec.role_description,
-                name=spec.name,
-                system_message=spec.system_prompt,
-                tools=spec.tools or None,
-                model=spec.model or None,
+            if app_config.guardrails.skip_plan_validation:
+                log.info("[guardrail:plan_validator] skipped by app config app_id=%s", app_config.app_id)
+            else:
+                plan_json = (
+                    plan.model_dump_json(by_alias=True) if isinstance(plan, GraphSpec)
+                    else json.dumps([s.model_dump() for s in plan])
+                )
+                validation = await orchestrator.validate_plan(effective_goal, plan_json)
+                log.info("[guardrail:plan_validator] app-routed valid=%s feedback=%r",
+                         validation["valid"], validation.get("feedback", ""))
+                yield "plan_validation", json.dumps({
+                    "valid": validation["valid"], "feedback": validation.get("feedback", ""), "attempt": 1,
+                })
+                if not validation["valid"]:
+                    tracer.record_guardrail("plan_validator")
+
+        else:
+            plan_feedback: str | None = None
+            MAX_PLAN_RETRIES = 3
+
+            for plan_attempt in range(1, MAX_PLAN_RETRIES + 1):
+                log.info("[plan] attempt=%d", plan_attempt)
+                plan_chunks: list[str] = []
+
+                async for item in orchestrator._generate_plan_stream(
+                    effective_goal, research_text, feedback=plan_feedback
+                ):
+                    if isinstance(item, GraphSpec):
+                        plan = item
+                        node_names = [n.name for n in item.nodes]
+                        edges = [(e.from_node, e.to_node) for e in item.edges]
+                        log.info("[plan] strategy=langgraph nodes=%s edges=%s entry=%s",
+                                 node_names, edges, item.entry)
+                        yield "plan_ready", json.dumps({
+                            "strategy": "langgraph",
+                            "spec": item.model_dump(by_alias=True),
+                        })
+                    elif isinstance(item, list):
+                        plan = item
+                        log.info("[plan] strategy=autogen agents=%s", [s.name for s in item])
+                        yield "plan_ready", json.dumps({
+                            "strategy": "autogen",
+                            "specs": [s.model_dump() for s in item],
+                        })
+                    else:
+                        plan_chunks.append(item)
+                        yield "plan_chunk", json.dumps({"text": item})
+
+                validation = await orchestrator.validate_plan(effective_goal, "".join(plan_chunks))
+                log.info("[guardrail:plan_validator] attempt=%d valid=%s feedback=%r",
+                         plan_attempt, validation["valid"], validation.get("feedback", ""))
+                yield "plan_validation", json.dumps({
+                    "valid": validation["valid"],
+                    "feedback": validation.get("feedback", ""),
+                    "attempt": plan_attempt,
+                })
+
+                if validation["valid"]:
+                    break
+
+                tracer.record_guardrail("plan_validator")
+                plan_feedback = validation["feedback"]
+                if plan_attempt == MAX_PLAN_RETRIES:
+                    log.warning("[guardrail:plan_validator] max retries reached — proceeding with last plan")
+
+        # ── Execute — AutoGen debate or LangGraph pipeline ────────────────────────
+        context_source: AgentConversation | GraphRunner
+        framework_used: str
+
+        if isinstance(plan, GraphSpec):
+            log.info("[execute] strategy=langgraph")
+            framework_used = "langgraph"
+            factory = LangGraphFactory(provider=req.provider)
+            runner = GraphRunner(factory=factory, spec=plan, tracer=tracer)
+            async for item in runner.run_stream(req.goal):
+                if isinstance(item, ConversationMessage):
+                    log.info("[node] %s | %d chars", item.agent, len(item.content))
+                    yield "agent_message", json.dumps({
+                        "agent": item.agent, "content": item.content, "round": item.round,
+                    })
+                elif isinstance(item, StopSignal):
+                    log.info("[stop] %s (by=%s)", item.reason, item.stopped_by)
+                    yield "stop_signal", json.dumps({
+                        "reason": item.reason, "stopped_by": item.stopped_by,
+                    })
+            context_source = runner
+
+        else:
+            log.info("[execute] strategy=autogen")
+            framework_used = "autogen"
+            specs: list[AgentSpec] = plan or []
+            factory = AutoGenFactory(provider=req.provider)
+            manager = AgentManager(factory, tracer=tracer)
+            agents = []
+            for spec in specs:
+                agent = await manager.spawn(
+                    role=spec.role_description,
+                    name=spec.name,
+                    system_message=spec.system_prompt,
+                    tools=spec.tools or None,
+                    model=spec.model or None,
+                )
+                log.info("[spawn] agent=%s tools=%s", spec.name, spec.tools)
+                agents.append(agent)
+
+            conversation = AgentConversation(
+                manager=manager,
+                agents=agents,
+                orchestrator=orchestrator,
+                max_rounds=req.max_rounds,
             )
-            log.info("[spawn] agent=%s tools=%s", spec.name, spec.tools)
-            agents.append(agent)
+            async for item in conversation.run_stream(req.goal):
+                if isinstance(item, ConversationMessage):
+                    log.info("[round %d] %s | %d chars", item.round, item.agent, len(item.content))
+                    yield "agent_message", json.dumps({
+                        "agent": item.agent, "content": item.content, "round": item.round,
+                    })
+                elif isinstance(item, StopSignal):
+                    log.info("[stop] %s (by=%s)", item.reason, item.stopped_by)
+                    yield "stop_signal", json.dumps({
+                        "reason": item.reason, "stopped_by": item.stopped_by,
+                    })
+            await manager.shutdown()
+            context_source = conversation
 
-        conversation = AgentConversation(
-            manager=manager,
-            agents=agents,
-            orchestrator=orchestrator,
-            max_rounds=req.max_rounds,
-        )
-        async for item in conversation.run_stream(req.goal):
-            if isinstance(item, ConversationMessage):
-                log.info("[round %d] %s | %d chars", item.round, item.agent, len(item.content))
-                yield "agent_message", json.dumps({
-                    "agent": item.agent, "content": item.content, "round": item.round,
-                })
-            elif isinstance(item, StopSignal):
-                log.info("[stop] %s (by=%s)", item.reason, item.stopped_by)
-                yield "stop_signal", json.dumps({
-                    "reason": item.reason, "stopped_by": item.stopped_by,
-                })
-        await manager.shutdown()
-        context_source = conversation
-
-    # Capture conversation text once — grounding check always uses the raw version
-    original_conversation_text = context_source.to_context_text()
-    synthesis_context = original_conversation_text
-
-    # ── Guardrail 3: Synthesize + Quality Check loop (max 1 retry) ───────────
-    report = ""
-    synthesis_feedback: str | None = None
-    MAX_QUALITY_RETRIES = 2  # 1 initial + 1 retry
-
-    for quality_attempt in range(1, MAX_QUALITY_RETRIES + 1):
-        log.info("[synthesize] attempt=%d", quality_attempt)
-
-        # Buffer chunks — only stream to client after quality check passes
-        # (prevents showing a failing synthesis that gets replaced)
-        synthesis_chunks: list[str] = []
-        async for chunk in orchestrator.synthesize_stream(
-            effective_goal, synthesis_context, feedback=synthesis_feedback
-        ):
-            synthesis_chunks.append(chunk)
-
-        report = "".join(synthesis_chunks)
-
-        qc = await orchestrator.quality_check(effective_goal, report)
-        log.info("[guardrail:quality_check] attempt=%d passes=%s feedback=%r",
-                 quality_attempt, qc["passes"], qc.get("feedback", ""))
-        yield "quality_check", json.dumps({
-            "passes": qc["passes"],
-            "feedback": qc.get("feedback", ""),
-            "attempt": quality_attempt,
-        })
-
-        if qc["passes"] or quality_attempt == MAX_QUALITY_RETRIES:
-            # Stream the final (passing or last-attempt) synthesis to client
-            for chunk in synthesis_chunks:
-                yield "synthesis_chunk", json.dumps({"text": chunk})
-            break
-
-        # Prepare retry — append feedback to context so synthesizer knows what to fix
-        synthesis_feedback = qc["feedback"]
+        # Capture conversation text once — grounding check always uses the raw version
+        original_conversation_text = context_source.to_context_text()
         synthesis_context = original_conversation_text
 
-    # ── Guardrail 4: Grounding Check ──────────────────────────────────────────
-    log.info("[guardrail:grounding_check] verifying claims against agent conversation")
-    gc = await orchestrator.grounding_check(effective_goal, original_conversation_text, report)
-    log.info("[guardrail:grounding_check] grounded=%s unsupported_count=%d",
-             gc["grounded"], len(gc.get("unsupported_claims", [])))
-    yield "grounding_check", json.dumps({
-        "grounded": gc["grounded"],
-        "unsupported_claims": gc.get("unsupported_claims", []),
-    })
+        # ── Guardrail 3: Synthesize + Quality Check loop (max 1 retry) ───────────
+        report = ""
+        synthesis_feedback: str | None = None
+        MAX_QUALITY_RETRIES = 2  # 1 initial + 1 retry
 
-    log.info("[done] result_len=%d", len(report))
-    yield "done", json.dumps({"result": report})
+        for quality_attempt in range(1, MAX_QUALITY_RETRIES + 1):
+            log.info("[synthesize] attempt=%d", quality_attempt)
+
+            # Buffer chunks — only stream to client after quality check passes
+            # (prevents showing a failing synthesis that gets replaced)
+            synthesis_chunks: list[str] = []
+            async for chunk in orchestrator.synthesize_stream(
+                effective_goal, synthesis_context, feedback=synthesis_feedback
+            ):
+                synthesis_chunks.append(chunk)
+
+            report = "".join(synthesis_chunks)
+
+            qc = await orchestrator.quality_check(effective_goal, report)
+            log.info("[guardrail:quality_check] attempt=%d passes=%s feedback=%r",
+                     quality_attempt, qc["passes"], qc.get("feedback", ""))
+            yield "quality_check", json.dumps({
+                "passes": qc["passes"],
+                "feedback": qc.get("feedback", ""),
+                "attempt": quality_attempt,
+            })
+
+            if qc["passes"] or quality_attempt == MAX_QUALITY_RETRIES:
+                # Stream the final (passing or last-attempt) synthesis to client
+                for chunk in synthesis_chunks:
+                    yield "synthesis_chunk", json.dumps({"text": chunk})
+                break
+
+            # Prepare retry — append feedback to context so synthesizer knows what to fix
+            tracer.record_guardrail("quality_check")
+            synthesis_feedback = qc["feedback"]
+            synthesis_context = original_conversation_text
+
+        # ── Guardrail 4: Grounding Check ──────────────────────────────────────────
+        if app_config is not None and not app_config.guardrails.hallucination_check:
+            log.info("[guardrail:grounding_check] skipped by app config app_id=%s", app_config.app_id)
+        else:
+            log.info("[guardrail:grounding_check] verifying claims against agent conversation")
+            gc = await orchestrator.grounding_check(effective_goal, original_conversation_text, report)
+            log.info("[guardrail:grounding_check] grounded=%s unsupported_count=%d",
+                     gc["grounded"], len(gc.get("unsupported_claims", [])))
+            if not gc["grounded"]:
+                tracer.record_guardrail("grounding_check")
+            yield "grounding_check", json.dumps({
+                "grounded": gc["grounded"],
+                "unsupported_claims": gc.get("unsupported_claims", []),
+            })
+
+        log.info("[done] result_len=%d", len(report))
+        await tracer.finish(outcome="success", framework_used=framework_used, report=report)
+        yield "done", json.dumps({"result": report})
+
+    except Exception as exc:
+        await tracer.finish(outcome="failed", error=str(exc))
+        raise
 
 
 def _sse(type: str, data: str) -> str:
@@ -314,7 +414,7 @@ def _sse(type: str, data: str) -> str:
 
 
 _ORCHESTRATION_EVENTS = {
-    "orchestrator_tool_call", "plan_chunk", "plan_ready",
+    "orchestrator_tool_call", "plan_chunk", "plan_ready", "app_routed",
     "goal_clarified", "plan_validation", "quality_check", "grounding_check",
 }
 _CONVERSATION_EVENTS = {"agent_message", "stop_signal"}
@@ -355,6 +455,35 @@ async def _filtered_stream(req: RunRequest, detail: DetailLevel) -> AsyncGenerat
 def health():
     """Liveness probe. Returns ``{"status": "ok"}`` when the server is up."""
     return {"status": "ok"}
+
+
+@app.get("/apps")
+def list_apps():
+    """List all registered apps (loaded from /apps at startup)."""
+    return [a.model_dump() for a in app_registry.list_apps()]
+
+
+@app.get("/traces")
+def list_traces(
+    limit: int = Query(default=10, ge=1, le=200),
+    app_id: str | None = None,
+    status: str | None = None,
+    since: str | None = None,
+    cost_above: float | None = None,
+):
+    """Query run traces. All filters are optional and combine with AND."""
+    return db.query_runs(
+        limit=limit, app_id=app_id, status=status, since=since, cost_above=cost_above,
+    )
+
+
+@app.get("/traces/{run_id}")
+def get_trace(run_id: str):
+    """Fetch a single run trace by ID."""
+    row = db.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No trace with run_id={run_id!r}")
+    return row
 
 
 @app.post("/run", response_model=RunResponse)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from agent_forge.core.agent import AgentStatus, BaseAgent
+from agent_forge.core.agent import AgentRunResult, AgentStatus, BaseAgent
 
 
 class LangGraphAgent(BaseAgent):
@@ -14,7 +14,7 @@ class LangGraphAgent(BaseAgent):
 
     Tools (if any) are bound to the model at creation time via
     ``llm.bind_tools()``.  The ``run()`` method handles the full
-    tool-calling loop internally, so callers just get back a plain string.
+    tool-calling loop internally, so callers just get back a result.
 
     Args:
         agent_id:       Unique identifier assigned by the factory.
@@ -22,6 +22,7 @@ class LangGraphAgent(BaseAgent):
         role:           Short role label (e.g. ``"analyst"``).
         llm:            A LangChain chat model, optionally with tools bound.
         system_message: System prompt written by the Orchestrator.
+        model:          Model name, recorded on the returned AgentRunResult.
     """
 
     def __init__(
@@ -31,12 +32,14 @@ class LangGraphAgent(BaseAgent):
         role: str,
         llm: Any,
         system_message: str,
+        model: str = "",
     ) -> None:
         super().__init__(agent_id=agent_id, name=name, role=role)
         self._llm = llm
         self._system_message = system_message
+        self._model = model
 
-    async def run(self, task: str, **kwargs: Any) -> str:
+    async def run(self, task: str, **kwargs: Any) -> AgentRunResult:
         """Run the agent on *task*, handling any tool calls, and return the result."""
         from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
         from agent_forge.tools import get_tool
@@ -47,8 +50,13 @@ class LangGraphAgent(BaseAgent):
         ]
 
         self.status = AgentStatus.RUNNING
+        input_tokens = 0
+        output_tokens = 0
 
         response = await self._llm.ainvoke(messages)
+        usage = getattr(response, "usage_metadata", None) or {}
+        input_tokens += usage.get("input_tokens", 0)
+        output_tokens += usage.get("output_tokens", 0)
 
         # Tool-calling loop
         while getattr(response, "tool_calls", None):
@@ -67,9 +75,17 @@ class LangGraphAgent(BaseAgent):
                     content=str(result),
                 ))
             response = await self._llm.ainvoke(messages)
+            usage = getattr(response, "usage_metadata", None) or {}
+            input_tokens += usage.get("input_tokens", 0)
+            output_tokens += usage.get("output_tokens", 0)
 
         self.status = AgentStatus.IDLE
-        return response.content
+        return AgentRunResult(
+            content=response.content,
+            model=self._model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
 
     async def close(self) -> None:
         """LangChain clients are stateless; just mark as closed."""

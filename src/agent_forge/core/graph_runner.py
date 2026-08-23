@@ -28,16 +28,19 @@ Failure handling:
 import logging
 import operator
 import re
+import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, TypedDict
 
 log = logging.getLogger("uvicorn.error")
 
+from agent_forge.core.agent import AgentRunResult
 from agent_forge.core.conversation import ConversationMessage, StopSignal
 
 if TYPE_CHECKING:
     from agent_forge.core.factory import AgentFactory
     from agent_forge.core.orchestrator import GraphSpec
+    from agent_forge.tracing import RunTracer
 
 # Matches {"route": "SOME_KEY"} anywhere in a string (case-insensitive)
 _ROUTE_JSON = re.compile(r'\{[^{}]*"route"\s*:\s*"(\w+)"[^{}]*\}', re.IGNORECASE)
@@ -62,16 +65,32 @@ def _is_valid_output(content: str) -> bool:
     return len((content or "").strip()) >= _MIN_OUTPUT_LENGTH
 
 
-async def _run_with_retry(agent: Any, task: str, label: str) -> str:
+async def _run_once_traced(agent: Any, task: str, label: str, tracer: RunTracer | None) -> str:
+    """Run agent.run() once, recording latency/usage/status to *tracer* if set."""
+    start = time.perf_counter()
+    try:
+        result = await agent.run(task)
+    except Exception:
+        if tracer is not None:
+            latency_ms = (time.perf_counter() - start) * 1000
+            tracer.record_agent(label, AgentRunResult(content="", model=""), latency_ms, status="failed")
+        raise
+    if tracer is not None:
+        latency_ms = (time.perf_counter() - start) * 1000
+        tracer.record_agent(label, result, latency_ms, status="success")
+    return result.content
+
+
+async def _run_with_retry(agent: Any, task: str, label: str, tracer: RunTracer | None = None) -> str:
     """
     Run an agent task with a single retry on invalid output.
     Falls back to a safe placeholder if both attempts fail.
     """
-    content = await agent.run(task)
+    content = await _run_once_traced(agent, task, label, tracer)
     if _is_valid_output(content):
         return content
     log.warning("[%s] invalid output (len=%d) — retrying", label, len(content or ""))
-    content = await agent.run(task)
+    content = await _run_once_traced(agent, task, label, tracer)
     if _is_valid_output(content):
         return content
     log.error("[%s] failed after retry — using fallback", label)
@@ -106,9 +125,10 @@ class GraphRunner:
         spec:    Graph specification produced by the Orchestrator.
     """
 
-    def __init__(self, factory: AgentFactory, spec: GraphSpec) -> None:
+    def __init__(self, factory: AgentFactory, spec: GraphSpec, tracer: RunTracer | None = None) -> None:
         self._factory = factory
         self._spec = spec
+        self._tracer = tracer
         self._messages: list[dict] = []
 
     async def run_stream(
@@ -165,7 +185,7 @@ class GraphRunner:
                         f"Choose the route that best matches your analysis."
                     )
                 # Raw content kept in state so router can read {"route": ...} JSON
-                content = await _run_with_retry(agent, task, node_name)
+                content = await _run_with_retry(agent, task, node_name, self._tracer)
                 return {"messages": [{"agent": node_name, "content": content}]}
             return node_fn
 
@@ -178,7 +198,9 @@ class GraphRunner:
         # ── No edges → parallel independent execution ─────────────────────────
         if not self._spec.edges:
             for node in self._spec.nodes:
-                content = await _run_with_retry(agents[node.name], f"{goal}\n\n{node.task_prompt}", node.name)
+                content = await _run_with_retry(
+                    agents[node.name], f"{goal}\n\n{node.task_prompt}", node.name, self._tracer
+                )
                 clean = _strip_route(content)
                 self._messages.append({"agent": node.name, "content": clean})
                 yield ConversationMessage(agent=node.name, content=clean, round=1)

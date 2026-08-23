@@ -38,11 +38,19 @@ class MCPServerConfig:
         command: Executable to launch for stdio transport (e.g. ``"npx"``).
         args:    Arguments for the stdio executable.
         url:     SSE endpoint URL for HTTP transport.
+        tools:   Optional allowlist of tool names to register from this
+                 server (matched against the server's own tool name, before
+                 the ``mcp_{name}_`` prefix is added). Empty list (default)
+                 registers every tool the server advertises. Use this to keep
+                 mutating tools (e.g. a git server's ``git_commit``,
+                 ``git_checkout``) out of the registry entirely for servers
+                 that should only ever be used read-only.
     """
     name: str
     command: str = ""
     args: list[str] = field(default_factory=list)
     url: str = ""
+    tools: list[str] = field(default_factory=list)
 
 
 def load_config(path: Path = _CONFIG_PATH) -> list[MCPServerConfig]:
@@ -106,6 +114,8 @@ class MCPBridge:
 
             tools_result = await session.list_tools()
             for tool in tools_result.tools:
+                if cfg.tools and tool.name not in cfg.tools:
+                    continue
                 full_name = f"mcp_{cfg.name}_{tool.name}"
 
                 # Capture session + tool name in closure
@@ -119,6 +129,10 @@ class MCPBridge:
                     return wrapper
 
                 wrapper = _make_wrapper(session, tool.name, tool.description or "")
+                # Preserve the MCP tool's real JSON schema — the wrapper's own
+                # signature is a generic **kwargs passthrough, so schema
+                # introspection on it would produce an empty/broken schema.
+                wrapper._mcp_input_schema = tool.input_schema  # type: ignore[attr-defined]
                 register_callable(full_name, wrapper, tool.description or "")
                 self._registered.append(full_name)
 

@@ -1,0 +1,30 @@
+{
+  "app_id": "logscribe",
+  "name": "LogScribe — Production Error Root-Cause Analysis",
+  "version": "1.0",
+  "triggers": [
+    "log error analysis",
+    "root cause analysis of a production error",
+    "error investigation using historical similar errors",
+    "on-call debugging assistance from log context"
+  ],
+  "description": "Performs root-cause analysis on a captured production error, given the new error's details (type, message, stack trace, variables) and semantically similar past errors already retrieved from history. Produces likely root cause, supporting evidence, and suggested next steps. Matches requests that present a structured 'error_type / message / stack_trace' block plus a list of similar past errors, asking for a root-cause hypothesis.",
+  "workflow": [
+    {
+      "agent": "root_cause_analyst",
+      "role": "You are a senior site reliability engineer performing root-cause analysis on a production error. You are given the newly captured error along with semantically similar errors seen in the past. Use the past context to spot recurring patterns, but focus your analysis on the new error. If the request includes a 'Repository path for git correlation' line, use your tools (passing that exact path as repo_path, or as the base for file paths) to investigate before finalizing your analysis: use git_log for recent commits touching the affected area, and git_show/git_diff on any commit that looks related — note that git_show only returns commit metadata and diffs, NOT a file's current full contents. If your analysis depends on a claim about a file's current contents (e.g. whether a field/function exists), verify it with read_text_file instead of inferring it from the diff alone — do not state what a file currently contains unless you actually read it. Call out explicitly whether a recent change looks implicated or not. Respond with: 1. Likely root cause 2. Supporting evidence from the log context (and from git/file history, if you checked it) 3. Suggested next steps to confirm/fix. Keep it concise.",
+      "tools": ["mcp_repo_git_log", "mcp_repo_git_show", "mcp_repo_git_diff", "mcp_repo_git_status", "mcp_fs_read_text_file", "mcp_fs_list_directory"]
+    }
+  ],
+  "framework": "langgraph",
+  "framework_locked": true,
+  "models": {
+    "root_cause_analyst": "gpt-5.4-mini"
+  },
+  "models_locked": false,
+  "guardrails": {
+    "skip_goal_clarity": true,
+    "skip_plan_validation": true,
+    "hallucination_check": true
+  }
+}

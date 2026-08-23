@@ -42,8 +42,9 @@ class LangGraphFactory(AgentFactory):
         from langchain_core.tools import StructuredTool
         from agent_forge.tools import get_tools
 
+        resolved_model = model or self._config.model
         kwargs_llm: dict[str, Any] = {
-            "model": model or self._config.model,
+            "model": resolved_model,
             "api_key": self._config.api_key,
         }
         if self._config.base_url:
@@ -59,6 +60,10 @@ class LangGraphFactory(AgentFactory):
                     func=fn if not inspect.iscoroutinefunction(fn) else None,
                     name=getattr(fn, "_tool_name", fn.__name__),
                     description=getattr(fn, "_tool_description", "") or fn.__doc__ or "",
+                    # MCP tool wrappers have a generic **kwargs signature —
+                    # skip introspection and use their real JSON schema instead.
+                    args_schema=getattr(fn, "_mcp_input_schema", None),
+                    infer_schema=getattr(fn, "_mcp_input_schema", None) is None,
                 )
                 for fn in resolved
             ]
@@ -71,6 +76,7 @@ class LangGraphFactory(AgentFactory):
             role=role,
             llm=llm,
             system_message=system_message,
+            model=resolved_model,
         )
         self._agents[agent_id] = agent
         return agent

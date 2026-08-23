@@ -1,0 +1,19 @@
+{
+  "app_id": "_dummy_echo",
+  "name": "Dummy Echo App",
+  "version": "0.1",
+  "triggers": ["zzz test echo app zzz", "dummy echo smoke test"],
+  "description": "Throwaway fixture used only to smoke-test the app registry routing mechanism (Phases 1-3). Not a real integration — safe to delete once registry routing is verified. Deliberately unlocked (framework_locked: false) to exercise the UNLOCKED tier's constrained-planning code path.",
+  "workflow": [
+    {"agent": "echo_agent", "role": "Read the user's goal and produce a concise one-paragraph summary of it, prefixed with 'ECHO:'."}
+  ],
+  "framework": "autogen",
+  "framework_locked": false,
+  "models": {},
+  "models_locked": false,
+  "guardrails": {
+    "skip_goal_clarity": true,
+    "skip_plan_validation": false,
+    "hallucination_check": false
+  }
+}

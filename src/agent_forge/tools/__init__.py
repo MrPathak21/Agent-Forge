@@ -78,9 +78,24 @@ _TYPE_MAP: dict = {int: "integer", float: "number", bool: "boolean", str: "strin
 
 def to_openai_schema(fn: Callable) -> dict:
     """Convert a registered tool function to OpenAI's function calling schema."""
+    name = getattr(fn, "_tool_name", fn.__name__)
+
+    # MCP tool wrappers have a generic **kwargs signature — their real schema
+    # (proper JSON Schema, already compatible with OpenAI's `parameters` field)
+    # is attached directly by MCPBridge instead of being introspectable.
+    mcp_schema = getattr(fn, "_mcp_input_schema", None)
+    if mcp_schema is not None:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": getattr(fn, "_tool_description", "") or "",
+                "parameters": mcp_schema,
+            },
+        }
+
     sig = inspect.signature(fn)
     doc = inspect.getdoc(fn) or ""
-    name = getattr(fn, "_tool_name", fn.__name__)
 
     properties: dict = {}
     required: list[str] = []

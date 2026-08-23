@@ -10,6 +10,18 @@
     "args": ["-y", "@modelcontextprotocol/server-github"]
   },
   {
+    "name": "repo",
+    "command": "uvx",
+    "args": ["mcp-server-git", "--repository", "/path/to/monitored/repo"],
+    "tools": ["git_log", "git_show", "git_diff", "git_status"]
+  },
+  {
+    "name": "fs",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/monitored/repo"],
+    "tools": ["read_text_file", "list_directory"]
+  },
+  {
     "name": "myserver",
     "url": "http://localhost:3000/sse"
   }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -9,6 +10,15 @@ class AgentStatus(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
     CLOSED = "closed"
+
+
+@dataclass
+class AgentRunResult:
+    """Result of a single BaseAgent.run() call, including token usage for tracing."""
+    content: str
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class BaseAgent(ABC):
@@ -30,8 +40,8 @@ class BaseAgent(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def run(self, task: str, **kwargs: Any) -> str:
-        """Execute a task and return a string result."""
+    async def run(self, task: str, **kwargs: Any) -> AgentRunResult:
+        """Execute a task and return the result, including token usage."""
 
     @abstractmethod
     async def close(self) -> None:
